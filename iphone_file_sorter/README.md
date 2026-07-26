@@ -11,9 +11,27 @@ Sort files copied from an iPhone's **Internal Storage** (or any folder tree) int
 
 ## Requirements
 
-- Python 3.9+ (standard library only — no pip packages needed)
+- Python 3.9+
+- For the web UI: `streamlit` (see `requirements.txt`)
+- Notebook / CLI sorter logic uses the standard library only
 
-## Quick start — Jupyter Notebook (recommended if you use notebooks)
+## Quick start — Web UI (recommended)
+
+### Easiest on Windows
+1. Copy iPhone Internal Storage folders to a local path first.
+2. Double-click `Start_UI.bat`
+3. Wait for the browser to open (usually http://localhost:8501)
+4. Paste **Source** and **Destination** folder paths
+5. Click **Preview**, then **Start sorting** (keep Dry run on the first time)
+
+### Or from a terminal
+```bat
+cd path\to\iphone_file_sorter
+python -m pip install -r requirements.txt
+python -m streamlit run app.py
+```
+
+## Quick start — Jupyter Notebook
 
 1. Copy your iPhone folders from File Explorer  
    (`This PC → Apple iPhone → Internal Storage`) into a local folder, for example:

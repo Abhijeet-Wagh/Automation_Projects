@@ -106,35 +106,47 @@ def sort_files(
     *,
     dry_run: bool = False,
     move: bool = False,
+    on_file=None,
+    log=print,
 ) -> dict[str, int]:
     """
     Copy (or move) files from source into categorized folders under destination.
+
+    on_file: optional callback(src, dest, category, processed, total)
+    log: callable used for line logging (default: print)
 
     Returns a counter of files handled per category.
     """
     if not source.exists() or not source.is_dir():
         raise FileNotFoundError(f"Source folder not found: {source}")
 
+    dest_resolved = destination.resolve()
+    files: list[Path] = []
+    for src_file in iter_source_files(source):
+        # Do not re-process files already inside the destination tree
+        try:
+            src_file.resolve().relative_to(dest_resolved)
+            continue
+        except (ValueError, OSError):
+            files.append(src_file)
+
     counts: Counter[str] = Counter()
     action = "Moving" if move else "Copying"
+    total = len(files)
 
     if not dry_run:
         destination.mkdir(parents=True, exist_ok=True)
 
-    for src_file in iter_source_files(source):
-        # Do not re-process files already inside the destination tree
-        try:
-            src_file.resolve().relative_to(destination.resolve())
-            continue
-        except (ValueError, OSError):
-            pass
-
+    for index, src_file in enumerate(files, start=1):
         category = categorize(src_file)
         category_dir = destination / category
         dest_file = unique_destination(category_dir, src_file.name)
 
-        print(f"{action}: {src_file} -> {dest_file}")
+        log(f"{action}: {src_file} -> {dest_file}")
         counts[category] += 1
+
+        if on_file is not None:
+            on_file(src_file, dest_file, category, index, total)
 
         if dry_run:
             continue
