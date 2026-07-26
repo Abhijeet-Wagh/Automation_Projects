@@ -156,6 +156,7 @@ def _init_state() -> None:
         "iphone_tree": None,
         "tree_selected": [],
         "tree_expanded": [],
+        "tree_expand_initialized": False,
         "completed_folders": [],
         "batch_size": 5,
     }
@@ -401,16 +402,22 @@ def render_folder_tree_picker(
     selected_now = {p for p in st.session_state.get("tree_selected", []) if p in valid}
     if sorted(selected_now) != list(st.session_state.get("tree_selected", [])):
         st.session_state["tree_selected"] = sorted(selected_now)
+
     expanded_now = [p for p in st.session_state.get("tree_expanded", []) if p in valid]
-    # Default: expand root so first level is visible
-    if not expanded_now and tree.get("path") in valid:
-        expanded_now = [tree["path"]]
+    # Expand root only once when a tree is first loaded — never force-reopen
+    # after the user collapses DCIM / uses Collapse all.
+    if not st.session_state.get("tree_expand_initialized", False):
+        if tree.get("path") in valid:
+            expanded_now = [tree["path"]]
+        st.session_state["tree_expand_initialized"] = True
     st.session_state["tree_expanded"] = expanded_now
 
     # Keep widget keys in sync before instantiating checkboxes
     _sync_tree_checkbox_keys(tree, set(st.session_state.get("tree_selected", [])))
 
-    with st.container(border=True):
+    st.caption("Scroll inside the box below when the folder list is long.")
+    # Fixed-height bordered box enables an internal scrollbar
+    with st.container(border=True, height=420):
         _render_tree_node(tree)
 
     selected_set = set(st.session_state.get("tree_selected", []))
@@ -448,6 +455,7 @@ def render_copy_from_iphone() -> None:
         st.session_state["iphone_tree"] = None
         st.session_state["tree_selected"] = []
         st.session_state["tree_expanded"] = []
+        st.session_state["tree_expand_initialized"] = False
         st.session_state["afc_serial"] = ""
 
     ok, detail = _pymobiledevice3_status()
@@ -530,12 +538,14 @@ def render_copy_from_iphone() -> None:
                 tree = list_afc_folder_tree(serial, max_depth=2)
                 st.session_state["iphone_tree"] = tree
                 st.session_state["tree_selected"] = []
-                # Expand root so first-level folders are visible
+                # Expand root once so first-level folders are visible
                 st.session_state["tree_expanded"] = [tree.get("path", "")]
+                st.session_state["tree_expand_initialized"] = True
                 _sync_tree_checkbox_keys(tree, set())
         except AfcError as exc:
             st.error(str(exc))
             st.session_state["iphone_tree"] = None
+            st.session_state["tree_expand_initialized"] = False
 
     tree = st.session_state.get("iphone_tree")
     if tree:
