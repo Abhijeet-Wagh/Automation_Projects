@@ -189,7 +189,10 @@ CATEGORIES: list[ContentCategory] = [
     ContentCategory(
         id="notes",
         label="Apple Notes (backup files)",
-        description="Selective backup of Notes-related files (best-effort path match).",
+        description=(
+            "Selective backup of Notes-related files (best-effort path match). "
+            "Can make backup much slower — try Contacts alone first if a run hangs."
+        ),
         kind="backup",
         backup_regexes=(
             r"(?i)Notes",

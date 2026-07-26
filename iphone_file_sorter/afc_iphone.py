@@ -1218,19 +1218,27 @@ async def _backup_selections_async(
     regexes: list[str],
     password: str,
     on_progress: Callable[[str, int, int, str], None] | None,
+    stall_seconds: int = 600,
 ) -> None:
+    """
+    Run a selective MobileBackup2 backup.
+
+    Aborts if on-disk file count/size does not grow for `stall_seconds`
+    (default 10 minutes) — that usually means the device session hung.
+    """
     from pymobiledevice3.lockdown import create_using_usbmux
     from pymobiledevice3.services.mobilebackup2 import Mobilebackup2Service
 
     backup_directory.mkdir(parents=True, exist_ok=True)
     started = time.time()
     last_pct = {"v": 0}
-    stop_heartbeat = asyncio.Event()
+    last_growth = {"files": -1, "bytes": -1, "t": time.time()}
     heartbeat_path = backup_directory / "_backup_heartbeat.txt"
 
     def _write_heartbeat(note: str) -> None:
         files, nbytes = _count_backup_files(backup_directory)
         elapsed = int(time.time() - started)
+        stalled_for = int(time.time() - last_growth["t"])
         text = (
             f"{_now()}\n"
             f"note={note}\n"
@@ -1238,22 +1246,33 @@ async def _backup_selections_async(
             f"device_progress_pct={last_pct['v']}\n"
             f"files_on_disk={files}\n"
             f"bytes_on_disk={nbytes}\n"
+            f"seconds_since_disk_growth={stalled_for}\n"
             f"selections={','.join(selections)}\n"
             f"regexes={','.join(regexes)}\n"
-            "hint=Selective backup often runs a long transfer then keeps only chosen DBs. "
-            "Empty 00-ff folders are normal. Wait for 100% unless this file stops updating "
-            "for 15+ minutes AND Explorer shows no new files.\n"
+            "hint=If seconds_since_disk_growth keeps rising past 600 and Explorer "
+            "shows no new files, stop with Ctrl+C and retry (unlock iPhone, try "
+            "Contacts only, enter backup password if encrypted).\n"
         )
         try:
             heartbeat_path.write_text(text, encoding="utf-8")
         except OSError:
             pass
 
+    def _mark_growth_if_needed() -> tuple[int, int]:
+        files, nbytes = _count_backup_files(backup_directory)
+        if files != last_growth["files"] or nbytes != last_growth["bytes"]:
+            last_growth["files"] = files
+            last_growth["bytes"] = nbytes
+            last_growth["t"] = time.time()
+        return files, nbytes
+
     def _prog(pct: float) -> None:
         fraction = max(0.0, min(float(pct), 100.0))
+        # Any device progress callback counts as activity even if disk is briefly quiet.
         last_pct["v"] = int(fraction)
+        last_growth["t"] = time.time()
         elapsed = int(time.time() - started)
-        files, nbytes = _count_backup_files(backup_directory)
+        files, nbytes = _mark_growth_if_needed()
         mb = nbytes / (1024 * 1024)
         _write_heartbeat("device_progress")
         if on_progress:
@@ -1267,29 +1286,6 @@ async def _backup_selections_async(
                 "backup",
             )
 
-    async def _heartbeat_loop() -> None:
-        # Device % can freeze for a long time while data still lands on disk.
-        while not stop_heartbeat.is_set():
-            elapsed = int(time.time() - started)
-            files, nbytes = _count_backup_files(backup_directory)
-            mb = nbytes / (1024 * 1024)
-            _write_heartbeat("heartbeat")
-            if on_progress:
-                on_progress(
-                    (
-                        f"still working · device last reported {last_pct['v']}% · "
-                        f"elapsed {elapsed // 60}m{elapsed % 60:02d}s · "
-                        f"{files} files ({mb:.1f} MB) on disk"
-                    ),
-                    max(last_pct["v"], 1),
-                    100,
-                    "backup",
-                )
-            try:
-                await asyncio.wait_for(stop_heartbeat.wait(), timeout=15.0)
-            except asyncio.TimeoutError:
-                continue
-
     async with await create_using_usbmux(serial=serial) as lockdown:
         async with Mobilebackup2Service(lockdown) as backup_client:
             preserve_rules = Mobilebackup2Service.resolve_backup_selection(selections)
@@ -1302,29 +1298,67 @@ async def _backup_selections_async(
             if on_progress:
                 on_progress(
                     (
-                        "Starting selective backup — this can take a long time. "
-                        "Empty hash folders are normal; watch file count / heartbeat file."
+                        "Starting selective backup. If no new files appear for 10 minutes, "
+                        "the app will abort as stuck."
                     ),
                     0,
                     100,
                     "backup",
                 )
             _write_heartbeat("starting")
-            hb_task = asyncio.create_task(_heartbeat_loop(), name="backup-heartbeat")
-            try:
-                await backup_client.backup(
+            _mark_growth_if_needed()
+
+            backup_task = asyncio.create_task(
+                backup_client.backup(
                     full=True,
                     backup_directory=str(backup_directory),
                     progress_callback=_prog,
                     filter_callback=filter_callback,
                     password=password or "",
-                )
+                ),
+                name="iphone-selective-backup",
+            )
+            try:
+                while not backup_task.done():
+                    await asyncio.sleep(15.0)
+                    elapsed = int(time.time() - started)
+                    files, nbytes = _mark_growth_if_needed()
+                    mb = nbytes / (1024 * 1024)
+                    stalled_for = int(time.time() - last_growth["t"])
+                    _write_heartbeat("monitor")
+                    if on_progress:
+                        on_progress(
+                            (
+                                f"monitoring · device last {last_pct['v']}% · "
+                                f"elapsed {elapsed // 60}m{elapsed % 60:02d}s · "
+                                f"{files} files ({mb:.1f} MB) · "
+                                f"no growth for {stalled_for}s"
+                            ),
+                            max(last_pct["v"], 1),
+                            100,
+                            "backup",
+                        )
+                    if stalled_for >= stall_seconds:
+                        backup_task.cancel()
+                        try:
+                            await backup_task
+                        except asyncio.CancelledError:
+                            pass
+                        raise AfcError(
+                            "Backup looks stuck: no new files and no progress for "
+                            f"{stall_seconds // 60} minutes. Unlock the iPhone, keep the "
+                            "screen on, unplug/replug USB, then retry with only "
+                            "**Contacts** (uncheck Notes). If backups are encrypted, "
+                            "enter the backup password."
+                        )
+                await backup_task
             finally:
-                stop_heartbeat.set()
-                try:
-                    await hb_task
-                except Exception:
-                    pass
+                if not backup_task.done():
+                    backup_task.cancel()
+                    try:
+                        await backup_task
+                    except asyncio.CancelledError:
+                        pass
                 _write_heartbeat("finished_or_stopped")
 
 
