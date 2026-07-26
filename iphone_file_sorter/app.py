@@ -687,6 +687,15 @@ def render_copy_from_iphone() -> None:
             if c.id in selected_categories
         )
         if needs_backup:
+            st.warning(
+                "**Backup can look stuck:** Apple’s backup protocol is slow. The bar may sit "
+                "at ~40% for a long time while files still appear on disk. "
+                "Empty `00`–`ff` folders are normal. "
+                "Watch `iPhone_Backup_Selected\\_backup_heartbeat.txt` — if that file’s "
+                "timestamp and `files_on_disk` keep updating, it is still working. "
+                "Only stop (Ctrl+C) if the heartbeat file is unchanged for **15+ minutes** "
+                "and Explorer shows no new/changed files."
+            )
             backup_password = st.text_input(
                 "iPhone backup password (only if encrypted backups are enabled)",
                 type="password",
@@ -812,7 +821,8 @@ def render_copy_from_iphone() -> None:
 
     try:
         with st.spinner(
-            "Copying from iPhone… useful files only; junk is skipped quietly."
+            "Copying from iPhone… if this is a backup, progress may pause for a long time "
+            "while files still write to disk. Check _backup_heartbeat.txt in the destination."
         ):
             if mode == "categories":
                 result = copy_content_categories(

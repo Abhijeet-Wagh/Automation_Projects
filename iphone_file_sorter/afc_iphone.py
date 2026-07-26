@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import posixpath
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -1192,6 +1193,23 @@ def _safe_dir_name(label: str) -> str:
     return cleaned.strip().replace(" ", "_")[:80] or "Content"
 
 
+def _count_backup_files(backup_directory: Path) -> tuple[int, int]:
+    """Return (file_count, total_bytes) under backup_directory (best-effort)."""
+    files = 0
+    total = 0
+    try:
+        for path in backup_directory.rglob("*"):
+            if path.is_file():
+                files += 1
+                try:
+                    total += path.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return files, total
+
+
 async def _backup_selections_async(
     serial: str,
     backup_directory: Path,
@@ -1205,17 +1223,72 @@ async def _backup_selections_async(
     from pymobiledevice3.services.mobilebackup2 import Mobilebackup2Service
 
     backup_directory.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+    last_pct = {"v": 0}
+    stop_heartbeat = asyncio.Event()
+    heartbeat_path = backup_directory / "_backup_heartbeat.txt"
+
+    def _write_heartbeat(note: str) -> None:
+        files, nbytes = _count_backup_files(backup_directory)
+        elapsed = int(time.time() - started)
+        text = (
+            f"{_now()}\n"
+            f"note={note}\n"
+            f"elapsed_sec={elapsed}\n"
+            f"device_progress_pct={last_pct['v']}\n"
+            f"files_on_disk={files}\n"
+            f"bytes_on_disk={nbytes}\n"
+            f"selections={','.join(selections)}\n"
+            f"regexes={','.join(regexes)}\n"
+            "hint=Selective backup often runs a long transfer then keeps only chosen DBs. "
+            "Empty 00-ff folders are normal. Wait for 100% unless this file stops updating "
+            "for 15+ minutes AND Explorer shows no new files.\n"
+        )
+        try:
+            heartbeat_path.write_text(text, encoding="utf-8")
+        except OSError:
+            pass
 
     def _prog(pct: float) -> None:
+        fraction = max(0.0, min(float(pct), 100.0))
+        last_pct["v"] = int(fraction)
+        elapsed = int(time.time() - started)
+        files, nbytes = _count_backup_files(backup_directory)
+        mb = nbytes / (1024 * 1024)
+        _write_heartbeat("device_progress")
         if on_progress:
-            # pct is typically 0-100
-            fraction = max(0.0, min(float(pct), 100.0))
             on_progress(
-                f"iPhone backup {fraction:.0f}%",
+                (
+                    f"iPhone backup {fraction:.0f}% · elapsed {elapsed // 60}m{elapsed % 60:02d}s · "
+                    f"{files} files ({mb:.1f} MB) on disk"
+                ),
                 int(fraction),
                 100,
                 "backup",
             )
+
+    async def _heartbeat_loop() -> None:
+        # Device % can freeze for a long time while data still lands on disk.
+        while not stop_heartbeat.is_set():
+            elapsed = int(time.time() - started)
+            files, nbytes = _count_backup_files(backup_directory)
+            mb = nbytes / (1024 * 1024)
+            _write_heartbeat("heartbeat")
+            if on_progress:
+                on_progress(
+                    (
+                        f"still working · device last reported {last_pct['v']}% · "
+                        f"elapsed {elapsed // 60}m{elapsed % 60:02d}s · "
+                        f"{files} files ({mb:.1f} MB) on disk"
+                    ),
+                    max(last_pct["v"], 1),
+                    100,
+                    "backup",
+                )
+            try:
+                await asyncio.wait_for(stop_heartbeat.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                continue
 
     async with await create_using_usbmux(serial=serial) as lockdown:
         async with Mobilebackup2Service(lockdown) as backup_client:
@@ -1228,18 +1301,31 @@ async def _backup_selections_async(
             )
             if on_progress:
                 on_progress(
-                    f"Starting selective backup ({', '.join(selections + regexes) or 'custom'})",
+                    (
+                        "Starting selective backup — this can take a long time. "
+                        "Empty hash folders are normal; watch file count / heartbeat file."
+                    ),
                     0,
                     100,
                     "backup",
                 )
-            await backup_client.backup(
-                full=True,
-                backup_directory=str(backup_directory),
-                progress_callback=_prog,
-                filter_callback=filter_callback,
-                password=password or "",
-            )
+            _write_heartbeat("starting")
+            hb_task = asyncio.create_task(_heartbeat_loop(), name="backup-heartbeat")
+            try:
+                await backup_client.backup(
+                    full=True,
+                    backup_directory=str(backup_directory),
+                    progress_callback=_prog,
+                    filter_callback=filter_callback,
+                    password=password or "",
+                )
+            finally:
+                stop_heartbeat.set()
+                try:
+                    await hb_task
+                except Exception:
+                    pass
+                _write_heartbeat("finished_or_stopped")
 
 
 async def _copy_content_categories_async(
