@@ -31,6 +31,9 @@ COPY_FLAGS_SKIP = (
     FOF_NOCONFIRMATION | FOF_NOCONFIRMMKDIR | FOF_SILENT | FOF_NOERRORUI
 )
 
+# Show Windows copy progress (like Explorer), auto-confirm prompts
+COPY_FLAGS_VISIBLE = FOF_NOCONFIRMATION | FOF_NOCONFIRMMKDIR
+
 
 class WindowsShellError(RuntimeError):
     pass
@@ -281,7 +284,11 @@ def _resolve_file_item(
     raise WindowsShellError(f"File not found on iPhone: {source}")
 
 
-def _wait_for_file(path: Path, timeout_sec: float = 90.0) -> tuple[bool, str]:
+def _wait_for_file(
+    path: Path,
+    timeout_sec: float = 45.0,
+    on_tick: Callable[[float, float], None] | None = None,
+) -> tuple[bool, str]:
     """
     Wait until a copied file exists with a stable non-zero size.
     Returns (ok, reason_if_not_ok).
@@ -292,14 +299,19 @@ def _wait_for_file(path: Path, timeout_sec: float = 90.0) -> tuple[bool, str]:
     saw_exists = False
 
     while time.time() - start < timeout_sec:
+        elapsed = time.time() - start
+        if on_tick is not None:
+            on_tick(elapsed, timeout_sec)
+
         if path.exists() and path.is_file():
             saw_exists = True
             try:
                 size = path.stat().st_size
             except OSError:
-                time.sleep(0.4)
+                time.sleep(0.5)
                 continue
 
+            # Accept any non-empty file that stayed the same size briefly
             if size > 0 and size == last_size:
                 stable_rounds += 1
                 if stable_rounds >= 2:
@@ -307,21 +319,212 @@ def _wait_for_file(path: Path, timeout_sec: float = 90.0) -> tuple[bool, str]:
             else:
                 stable_rounds = 0
                 last_size = size
-        time.sleep(0.4)
+        time.sleep(0.5)
 
     if saw_exists:
         try:
             size = path.stat().st_size if path.exists() else 0
         except OSError:
             size = 0
-        if size <= 0:
-            return False, "File appeared but stayed empty (likely MTP/copy failure)"
-        return False, "Timed out waiting for file size to stabilize"
+        if size > 0:
+            return True, ""
+        return False, "File appeared but stayed empty (likely MTP/copy failure)"
     return False, "Timed out — file did not appear at destination"
+
+
+def _count_files(folder: Path) -> int:
+    if not folder.exists():
+        return 0
+    return sum(1 for p in folder.rglob("*") if p.is_file())
+
+
+def _wait_for_folder_copy(
+    dest_folder: Path,
+    *,
+    timeout_sec: float = 7200.0,
+    on_tick: Callable[[int, float], None] | None = None,
+) -> tuple[bool, int, str]:
+    """
+    Wait until a folder copy finishes (file count stops changing).
+    Returns (ok, file_count, reason).
+    """
+    start = time.time()
+    last_count = -1
+    stable_rounds = 0
+
+    while time.time() - start < timeout_sec:
+        count = _count_files(dest_folder)
+        elapsed = time.time() - start
+        if on_tick is not None:
+            on_tick(count, elapsed)
+
+        if count > 0 and count == last_count:
+            stable_rounds += 1
+            # ~5 seconds with no new files
+            if stable_rounds >= 5:
+                return True, count, ""
+        else:
+            stable_rounds = 0
+            last_count = count
+        time.sleep(1.0)
+
+    count = _count_files(dest_folder)
+    if count > 0:
+        return True, count, "Timed out but some files arrived"
+    return False, 0, "Timed out — folder copy produced no files"
+
+
+def _resolve_folder_item(media_root: Any, folder_rel: str) -> Any:
+    """Return the Shell folder item for a relative path under media_root."""
+    if not folder_rel:
+        raise WindowsShellError("Cannot resolve empty folder path as a single item.")
+    parts = [p for p in folder_rel.replace("\\", "/").split("/") if p]
+    parent = media_root
+    for part in parts[:-1]:
+        parent = get_child_folder(parent, part)
+    name = parts[-1]
+    for item in parent.Items():
+        if str(item.Name) == name and _is_folder_item(item):
+            return item
+    raise WindowsShellError(f"Folder not found on iPhone: {folder_rel}")
 
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def copy_folders_bulk(
+    device_name: str,
+    folder_names: list[str],
+    destination: Path,
+    *,
+    log_path: Path | None = None,
+    folder_timeout_sec: float = 7200.0,
+    on_progress: Callable[[str, int, int, str], None] | None = None,
+) -> CopyResult:
+    """
+    Copy each selected folder as a whole using the Windows copy dialog.
+
+    Much faster/more reliable than file-by-file MTP copies for large folders.
+    If Windows skips bad files, remaining files still copy.
+    """
+    if len(folder_names) == 0:
+        return CopyResult(selected_folders=[])
+
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    if log_path is None:
+        log_path = default_log_path(destination)
+
+    succeeded: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+
+    with _com_initialized():
+        shell = _shell()
+        media_root, media_label = find_internal_storage(device_name)
+        dest_ns = shell.NameSpace(str(destination.resolve()))
+        if dest_ns is None:
+            raise WindowsShellError(f"Could not open destination: {destination}")
+
+        # Expand "" into all top-level children
+        targets: list[str] = []
+        for folder_rel in folder_names:
+            if folder_rel == "":
+                targets.extend(list_child_names(media_root))
+            else:
+                targets.append(folder_rel)
+
+        # De-dupe preserving order
+        seen: set[str] = set()
+        unique_targets: list[str] = []
+        for t in targets:
+            if t not in seen:
+                seen.add(t)
+                unique_targets.append(t)
+
+        total = len(unique_targets)
+        for index, folder_rel in enumerate(unique_targets, start=1):
+            if on_progress:
+                on_progress(folder_rel, index, total, "copying folder")
+
+            dest_folder = destination / folder_rel
+            try:
+                item = _resolve_folder_item(media_root, folder_rel)
+                dest_ns.CopyHere(item, COPY_FLAGS_VISIBLE)
+
+                def _tick(count: int, elapsed: float, _folder=folder_rel, _i=index, _t=total):
+                    if on_progress:
+                        on_progress(
+                            f"{_folder} ({count} files, {int(elapsed)}s)",
+                            _i,
+                            _t,
+                            "copying folder",
+                        )
+
+                ok, count, reason = _wait_for_folder_copy(
+                    dest_folder,
+                    timeout_sec=folder_timeout_sec,
+                    on_tick=_tick,
+                )
+                if not ok:
+                    raise WindowsShellError(reason)
+
+                # Log each arrived file as success
+                if dest_folder.exists():
+                    for path in dest_folder.rglob("*"):
+                        if path.is_file():
+                            rel = str(path.relative_to(dest_folder)).replace("\\", "/")
+                            succeeded.append(
+                                {
+                                    "timestamp": _now(),
+                                    "device": device_name,
+                                    "source_folder": folder_rel,
+                                    "file_name": path.name,
+                                    "relative_path": rel,
+                                    "destination_path": str(path),
+                                    "status": "Copied",
+                                }
+                            )
+
+                if on_progress:
+                    on_progress(
+                        f"{folder_rel} ({count} files)",
+                        index,
+                        total,
+                        "done",
+                    )
+
+            except Exception as exc:  # noqa: BLE001
+                failed.append(
+                    {
+                        "timestamp": _now(),
+                        "device": device_name,
+                        "source_folder": folder_rel,
+                        "file_name": "",
+                        "relative_path": "",
+                        "source_path": f"{device_name}/{media_label}/{folder_rel}",
+                        "destination_path": str(dest_folder),
+                        "error": str(exc),
+                        "status": "Skipped",
+                    }
+                )
+                if on_progress:
+                    on_progress(folder_rel, index, total, "skipped")
+                continue
+
+    write_copy_excel_log(
+        log_path,
+        device_name=device_name,
+        selected_folders=unique_targets,
+        succeeded=succeeded,
+        failed=failed,
+    )
+    return CopyResult(
+        succeeded=succeeded,
+        failed=failed,
+        log_path=Path(log_path),
+        selected_folders=list(unique_targets),
+    )
 
 
 def copy_folders_file_by_file(
@@ -330,7 +533,7 @@ def copy_folders_file_by_file(
     destination: Path,
     *,
     log_path: Path | None = None,
-    file_timeout_sec: float = 90.0,
+    file_timeout_sec: float = 45.0,
     on_progress: Callable[[str, int, int, str], None] | None = None,
 ) -> CopyResult:
     """
@@ -423,8 +626,23 @@ def copy_folders_file_by_file(
                     except OSError:
                         pass
 
-                dest_ns.CopyHere(item, COPY_FLAGS_SKIP)
-                ok, reason = _wait_for_file(dest_file, timeout_sec=file_timeout_sec)
+                # Visible Windows dialog helps MTP transfers; user can Skip bad files
+                dest_ns.CopyHere(item, COPY_FLAGS_VISIBLE)
+
+                def _tick(elapsed: float, timeout: float, _label=label, _i=index, _t=total):
+                    if on_progress:
+                        on_progress(
+                            f"{_label} (waiting {int(elapsed)}s / {int(timeout)}s)",
+                            _i,
+                            _t,
+                            "waiting",
+                        )
+
+                ok, reason = _wait_for_file(
+                    dest_file,
+                    timeout_sec=file_timeout_sec,
+                    on_tick=_tick,
+                )
                 if not ok:
                     # Clean empty stub if present
                     try:

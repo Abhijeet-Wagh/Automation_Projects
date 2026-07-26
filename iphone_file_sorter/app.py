@@ -25,6 +25,7 @@ from sort_files import CATEGORY_EXTENSIONS, categorize, iter_source_files, sort_
 try:
     from windows_iphone import (
         WindowsShellError,
+        copy_folders_bulk,
         copy_folders_file_by_file,
         is_windows,
         list_iphone_child_folders,
@@ -45,6 +46,9 @@ except Exception:  # pragma: no cover - import safety on non-Windows
 
     def list_iphone_child_folders(_device_name: str, _parent_rel_path: str):
         return []
+
+    def copy_folders_bulk(*_args, **_kwargs):
+        raise RuntimeError("iPhone copy is only available on Windows.")
 
     def copy_folders_file_by_file(*_args, **_kwargs):
         raise RuntimeError("iPhone copy is only available on Windows.")
@@ -381,13 +385,29 @@ def render_copy_from_iphone() -> None:
         help_text="Files/folders from the iPhone will be copied here.",
     )
 
-    file_timeout = st.slider(
-        "Per-file wait timeout (seconds)",
-        min_value=15,
-        max_value=300,
-        value=90,
-        help="If a file doesn’t finish copying in time, it is logged as failed and skipped.",
+    copy_mode = st.radio(
+        "Copy mode",
+        options=[
+            "Fast: whole folders (Windows copy dialog) — recommended",
+            "Detailed: file-by-file (slower, auto-skip + Excel log)",
+        ],
+        index=0,
+        help=(
+            "Fast mode copies each selected folder like File Explorer and shows the "
+            "Windows progress window. File-by-file mode is much slower on iPhone."
+        ),
     )
+    use_file_by_file = copy_mode.startswith("Detailed")
+
+    file_timeout = 45
+    if use_file_by_file:
+        file_timeout = st.slider(
+            "Per-file wait timeout (seconds)",
+            min_value=15,
+            max_value=180,
+            value=30,
+            help="If a file doesn’t finish in time, it is skipped and logged.",
+        )
 
     also_sort = st.checkbox(
         "After copy, also sort into Images / Videos / Documents / Excel / PDF / Other",
@@ -402,10 +422,16 @@ def render_copy_from_iphone() -> None:
             help_text="Category folders will be created here after copying.",
         )
 
-    st.caption(
-        "Failed files are skipped automatically. An Excel log is saved in the destination "
-        "folder with source path, destination path, and error details."
-    )
+    if use_file_by_file:
+        st.caption(
+            "File-by-file can look stuck on file 1/N for up to the timeout. "
+            "Keep the iPhone unlocked. Prefer Fast mode for large folders."
+        )
+    else:
+        st.caption(
+            "A Windows copy window should appear. If a file errors, click Skip and "
+            "let the rest continue. An Excel log of arrived files is saved at the end."
+        )
 
     # selected_folders can be [""] for full root — treat as valid selection
     has_selection = bool(selected_folders) or selected_folders == [""]
@@ -425,9 +451,19 @@ def render_copy_from_iphone() -> None:
     dest_path = Path(destination).expanduser()
     progress = st.progress(0, text="Starting copy...")
     status = st.empty()
+    tip = st.empty()
+    tip.info(
+        "Keep the iPhone unlocked. "
+        + (
+            "Watch for a Windows copy dialog — use Skip on bad files."
+            if not use_file_by_file
+            else f"Waiting up to {file_timeout}s per file, then auto-skip."
+        )
+    )
 
     def on_progress(name: str, index: int, total: int, stage: str) -> None:
-        fraction = 0 if total == 0 else index / total
+        fraction = 0 if total == 0 else index / max(total, 1)
+        # For waiting stage, show partial progress within the current item
         progress.progress(
             min(max(fraction, 0.0), 1.0),
             text=f"{index}/{total}: {stage} · {name}",
@@ -435,14 +471,25 @@ def render_copy_from_iphone() -> None:
         status.write(f"**{stage.title()}:** `{name}`")
 
     try:
-        with st.spinner("Copying files from iPhone (skipping failures)..."):
-            result = copy_folders_file_by_file(
-                device,
-                selected_folders,
-                dest_path,
-                file_timeout_sec=float(file_timeout),
-                on_progress=on_progress,
-            )
+        if use_file_by_file:
+            with st.spinner("Copying file-by-file from iPhone..."):
+                result = copy_folders_file_by_file(
+                    device,
+                    selected_folders,
+                    dest_path,
+                    file_timeout_sec=float(file_timeout),
+                    on_progress=on_progress,
+                )
+        else:
+            with st.spinner(
+                "Copying whole folders via Windows dialog (this can take a while)..."
+            ):
+                result = copy_folders_bulk(
+                    device,
+                    selected_folders,
+                    dest_path,
+                    on_progress=on_progress,
+                )
     except WindowsShellError as exc:
         st.error(str(exc))
         return
