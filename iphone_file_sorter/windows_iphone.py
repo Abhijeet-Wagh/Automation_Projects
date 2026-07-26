@@ -90,19 +90,24 @@ def list_portable_apple_devices() -> list[str]:
     if not is_windows():
         return []
 
-    with _com_initialized():
-        shell = _shell()
-        computer = shell.NameSpace(THIS_PC)
-        if computer is None:
-            return []
+    try:
+        with _com_initialized():
+            shell = _shell()
+            computer = shell.NameSpace(THIS_PC)
+            if computer is None:
+                return []
 
-        names: list[str] = []
-        for item in computer.Items():
-            name = str(item.Name)
-            lower = name.lower()
-            if "iphone" in lower or "ipad" in lower or "apple" in lower:
-                names.append(name)
-        return names
+            names: list[str] = []
+            for item in computer.Items():
+                name = str(item.Name)
+                lower = name.lower()
+                if "iphone" in lower or "ipad" in lower or "apple" in lower:
+                    names.append(name)
+            return names
+    except WindowsShellError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise WindowsShellError(f"Failed to list devices: {exc}") from exc
 
 
 def _device_folder(device_name: str) -> Any:
@@ -151,9 +156,81 @@ def find_internal_storage(device_name: str) -> tuple[Any, str]:
 
 def list_iphone_media_folders(device_name: str) -> list[str]:
     """List copyable folders under the iPhone media root."""
-    with _com_initialized():
-        root, _ = find_internal_storage(device_name)
-        return sorted(list_child_names(root))
+    try:
+        with _com_initialized():
+            root, _ = find_internal_storage(device_name)
+            return sorted(list_child_names(root))
+    except WindowsShellError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise WindowsShellError(f"Failed to list iPhone folders: {exc}") from exc
+
+
+def _build_folder_tree_node(
+    folder: Any,
+    *,
+    name: str,
+    rel_path: str,
+    max_depth: int,
+    depth: int,
+) -> dict[str, Any]:
+    children: list[dict[str, Any]] = []
+    if depth < max_depth:
+        folder_items = []
+        for item in list(folder.Items()):
+            if _is_folder_item(item):
+                folder_items.append(item)
+        folder_items.sort(key=lambda it: str(it.Name).lower())
+        for item in folder_items:
+            child_name = str(item.Name)
+            child_rel = f"{rel_path}/{child_name}" if rel_path else child_name
+            child_folder = item.GetFolder
+            if child_folder is None:
+                continue
+            children.append(
+                _build_folder_tree_node(
+                    child_folder,
+                    name=child_name,
+                    rel_path=child_rel,
+                    max_depth=max_depth,
+                    depth=depth + 1,
+                )
+            )
+    return {"name": name, "path": rel_path, "children": children}
+
+
+def list_iphone_folder_tree(device_name: str, *, max_depth: int = 4) -> dict[str, Any]:
+    """
+    Return a nested folder tree under Internal Storage.
+
+    Root node path is "" (empty string). Child paths are relative to that root,
+    e.g. "202403_b" or "Documents/MyApp".
+    """
+    try:
+        with _com_initialized():
+            root, media_label = find_internal_storage(device_name)
+            return _build_folder_tree_node(
+                root,
+                name=media_label,
+                rel_path="",
+                max_depth=max_depth,
+                depth=0,
+            )
+    except WindowsShellError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise WindowsShellError(f"Failed to build iPhone folder tree: {exc}") from exc
+
+
+def get_folder_by_rel_path(media_root: Any, rel_path: str) -> Any:
+    """Resolve a relative folder path under media_root. '' returns media_root."""
+    if not rel_path:
+        return media_root
+    folder = media_root
+    for part in rel_path.replace("\\", "/").split("/"):
+        if part:
+            folder = get_child_folder(folder, part)
+    return folder
 
 
 def _is_folder_item(item: Any) -> bool:
@@ -182,19 +259,21 @@ def _enumerate_relative_files(folder: Any, prefix: str = "") -> list[str]:
 
 
 def _resolve_file_item(
-    media_root: Any, top_folder: str, relative_path: str
+    media_root: Any, folder_rel: str, file_rel: str
 ) -> tuple[Any, Any]:
-    """Return (file_item, parent_folder) for a relative path under top_folder."""
-    folder = get_child_folder(media_root, top_folder)
-    parts = relative_path.replace("\\", "/").split("/")
+    """Return (file_item, parent_folder) for file_rel under folder_rel."""
+    folder = get_folder_by_rel_path(media_root, folder_rel)
+    parts = file_rel.replace("\\", "/").split("/")
     for part in parts[:-1]:
-        folder = get_child_folder(folder, part)
+        if part:
+            folder = get_child_folder(folder, part)
 
     filename = parts[-1]
     for item in folder.Items():
         if str(item.Name) == filename and not _is_folder_item(item):
             return item, folder
-    raise WindowsShellError(f"File not found on iPhone: {top_folder}/{relative_path}")
+    source = f"{folder_rel}/{file_rel}" if folder_rel else file_rel
+    raise WindowsShellError(f"File not found on iPhone: {source}")
 
 
 def _wait_for_file(path: Path, timeout_sec: float = 90.0) -> tuple[bool, str]:
@@ -252,11 +331,14 @@ def copy_folders_file_by_file(
     """
     Copy all files under the selected iPhone folders to destination.
 
+    folder_names are relative paths under Internal Storage.
+    Use "" to copy the entire media root.
+
     - Works file-by-file
     - On error/timeout for one file: log it, skip, continue
     - Writes an Excel log with failed/successful details
     """
-    if not folder_names:
+    if len(folder_names) == 0:
         return CopyResult(selected_folders=[])
 
     destination = Path(destination)
@@ -268,22 +350,29 @@ def copy_folders_file_by_file(
         shell = _shell()
         media_root, media_label = find_internal_storage(device_name)
 
-        # Build job list: (top_folder, relative_path)
+        # Build job list: (folder_rel, file_rel_within_folder)
         normalized_jobs: list[tuple[str, str]] = []
         failed: list[dict[str, Any]] = []
-        for folder_name in folder_names:
+        for folder_rel in folder_names:
+            display_folder = folder_rel or media_label
             try:
-                folder = get_child_folder(media_root, folder_name)
+                folder = get_folder_by_rel_path(media_root, folder_rel)
             except WindowsShellError as exc:
                 failed.append(
                     {
                         "timestamp": _now(),
                         "device": device_name,
-                        "source_folder": folder_name,
+                        "source_folder": display_folder,
                         "file_name": "",
                         "relative_path": "",
-                        "source_path": f"{device_name}/{media_label}/{folder_name}",
-                        "destination_path": str(destination / folder_name),
+                        "source_path": (
+                            f"{device_name}/{media_label}/{folder_rel}"
+                            if folder_rel
+                            else f"{device_name}/{media_label}"
+                        ),
+                        "destination_path": str(
+                            destination / folder_rel if folder_rel else destination
+                        ),
                         "error": str(exc),
                         "status": "Skipped",
                     }
@@ -291,23 +380,30 @@ def copy_folders_file_by_file(
                 continue
 
             for rel in _enumerate_relative_files(folder):
-                normalized_jobs.append((folder_name, rel))
+                normalized_jobs.append((folder_rel, rel))
 
         succeeded: list[dict[str, Any]] = []
         total = len(normalized_jobs)
 
-        for index, (folder_name, rel) in enumerate(normalized_jobs, start=1):
+        for index, (folder_rel, rel) in enumerate(normalized_jobs, start=1):
             file_name = Path(rel).name
-            source_path = f"{device_name}/{media_label}/{folder_name}/{rel}"
-            dest_file = destination / folder_name / Path(rel)
+            display_folder = folder_rel or media_label
+            if folder_rel:
+                source_path = f"{device_name}/{media_label}/{folder_rel}/{rel}"
+                dest_file = destination / folder_rel / Path(rel)
+                label = f"{folder_rel}/{rel}"
+            else:
+                source_path = f"{device_name}/{media_label}/{rel}"
+                dest_file = destination / Path(rel)
+                label = rel
+
             dest_file.parent.mkdir(parents=True, exist_ok=True)
 
-            label = f"{folder_name}/{rel}"
             if on_progress:
                 on_progress(label, index, total, "copying")
 
             try:
-                item, _parent = _resolve_file_item(media_root, folder_name, rel)
+                item, _parent = _resolve_file_item(media_root, folder_rel, rel)
                 dest_ns = shell.NameSpace(str(dest_file.parent.resolve()))
                 if dest_ns is None:
                     raise WindowsShellError(
@@ -337,7 +433,7 @@ def copy_folders_file_by_file(
                     {
                         "timestamp": _now(),
                         "device": device_name,
-                        "source_folder": folder_name,
+                        "source_folder": display_folder,
                         "file_name": file_name,
                         "relative_path": rel,
                         "destination_path": str(dest_file),
@@ -352,7 +448,7 @@ def copy_folders_file_by_file(
                     {
                         "timestamp": _now(),
                         "device": device_name,
-                        "source_folder": folder_name,
+                        "source_folder": display_folder,
                         "file_name": file_name,
                         "relative_path": rel,
                         "source_path": source_path,
@@ -368,7 +464,7 @@ def copy_folders_file_by_file(
     write_copy_excel_log(
         log_path,
         device_name=device_name,
-        selected_folders=folder_names,
+        selected_folders=[f or media_label for f in folder_names],
         succeeded=succeeded,
         failed=failed,
     )

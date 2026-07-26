@@ -13,6 +13,7 @@ from pathlib import Path
 import streamlit as st
 
 from folder_picker import pick_folder
+from folder_tree import all_paths, apply_check, count_folders, selection_roots
 from sort_files import CATEGORY_EXTENSIONS, categorize, iter_source_files, sort_files
 
 try:
@@ -20,7 +21,7 @@ try:
         WindowsShellError,
         copy_folders_file_by_file,
         is_windows,
-        list_iphone_media_folders,
+        list_iphone_folder_tree,
         list_portable_apple_devices,
     )
 except Exception:  # pragma: no cover - import safety on non-Windows
@@ -32,8 +33,8 @@ except Exception:  # pragma: no cover - import safety on non-Windows
     def list_portable_apple_devices() -> list[str]:
         return []
 
-    def list_iphone_media_folders(_device_name: str) -> list[str]:
-        return []
+    def list_iphone_folder_tree(_device_name: str, *, max_depth: int = 4):
+        return {"name": "Internal Storage", "path": "", "children": []}
 
     def copy_folders_file_by_file(*_args, **_kwargs):
         raise RuntimeError("iPhone copy is only available on Windows.")
@@ -54,8 +55,8 @@ def _init_state() -> None:
         "sort_source": "",
         "sort_destination": "",
         "selected_device": "",
-        "iphone_folders": [],
-        "ms_folders": [],
+        "iphone_tree": None,
+        "tree_selected": [],
         "completed_folders": [],
         "batch_size": 5,
     }
@@ -123,61 +124,112 @@ def validate_local_paths(source: Path, destination: Path) -> str | None:
         return None
 
 
-def render_batch_folder_picker(folders: list[str]) -> list[str]:
-    """Folder multiselect with batch helpers (select all / clear / next batch)."""
-    st.markdown("#### Choose folders for this batch")
-    remaining = [f for f in folders if f not in st.session_state["completed_folders"]]
-    done_count = len(st.session_state["completed_folders"])
+def _sync_tree_checkbox_keys(tree: dict, selected: set[str]) -> None:
+    """Keep checkbox widget keys aligned with selection set."""
+    for path in all_paths(tree):
+        st.session_state[f"tree_cb::{path}"] = path in selected
+
+
+def _render_tree_node(node: dict, tree_root: dict, depth: int = 0) -> None:
+    path = node["path"]
+    children = node.get("children") or []
+    selected = set(st.session_state.get("tree_selected", []))
+    checked = path in selected
+    indent = "  " * depth  # em-space indent for tree levels
+    child_count = len(children)
+    suffix = f"  ({child_count} subfolders)" if child_count else ""
+    icon = "📁" if depth == 0 or child_count else "📂"
+    label = f"{indent}{icon} {node['name']}{suffix}"
+
+    key = f"tree_cb::{path}"
+    if key not in st.session_state:
+        st.session_state[key] = checked
+
+    new_val = st.checkbox(label, key=key)
+    if new_val != checked:
+        updated = apply_check(selected, tree_root, path, new_val)
+        st.session_state["tree_selected"] = sorted(updated)
+        _sync_tree_checkbox_keys(tree_root, updated)
+        st.rerun()
+
+    for child in children:
+        _render_tree_node(child, tree_root, depth + 1)
+
+
+def render_folder_tree_picker(tree: dict) -> list[str]:
+    """Checkbox tree with parent→child cascade selection."""
+    st.markdown("#### iPhone folder tree")
     st.caption(
-        f"{len(folders)} folders total · {done_count} already completed in this session · "
-        f"{len(remaining)} remaining"
+        "Check a top folder to select all subfolders automatically. "
+        "You can still uncheck individual folders."
+    )
+
+    top_level = [c["path"] for c in (tree.get("children") or [])]
+    remaining = [p for p in top_level if p not in st.session_state["completed_folders"]]
+    st.caption(
+        f"{count_folders(tree)} folders under **{tree.get('name', 'Internal Storage')}** · "
+        f"{len(st.session_state['completed_folders'])} top-level completed · "
+        f"{len(remaining)} top-level remaining"
     )
 
     batch_size = st.number_input(
         "Batch size (for Next batch)",
         min_value=1,
-        max_value=max(1, len(folders)),
+        max_value=max(1, len(top_level) or 1),
         value=int(st.session_state.get("batch_size", 5)),
         step=1,
-        help="How many remaining folders to select when you click Next batch.",
+        help="Select the next N remaining top-level folders (and their subfolders).",
     )
     st.session_state["batch_size"] = int(batch_size)
 
     b1, b2, b3, b4 = st.columns(4)
-    if b1.button("Select all remaining", use_container_width=True):
-        st.session_state["ms_folders"] = remaining
+    if b1.button("Select all", use_container_width=True):
+        selected = set(all_paths(tree))
+        st.session_state["tree_selected"] = sorted(selected)
+        _sync_tree_checkbox_keys(tree, selected)
         st.rerun()
     if b2.button("Next batch", use_container_width=True):
-        st.session_state["ms_folders"] = remaining[: int(batch_size)]
+        batch = remaining[: int(batch_size)]
+        selected: set[str] = set()
+        for path in batch:
+            selected = apply_check(selected, tree, path, True)
+        st.session_state["tree_selected"] = sorted(selected)
+        _sync_tree_checkbox_keys(tree, selected)
         st.rerun()
     if b3.button("Clear selection", use_container_width=True):
-        st.session_state["ms_folders"] = []
+        st.session_state["tree_selected"] = []
+        _sync_tree_checkbox_keys(tree, set())
         st.rerun()
     if b4.button("Reset completed", use_container_width=True):
         st.session_state["completed_folders"] = []
         st.rerun()
 
-    # Drop stale selections if the iPhone folder list changed
-    current = [f for f in st.session_state.get("ms_folders", []) if f in folders]
-    if current != list(st.session_state.get("ms_folders", [])):
-        st.session_state["ms_folders"] = current
+    # Prune invalid selections if tree reloaded
+    valid = set(all_paths(tree))
+    selected_now = {p for p in st.session_state.get("tree_selected", []) if p in valid}
+    if sorted(selected_now) != list(st.session_state.get("tree_selected", [])):
+        st.session_state["tree_selected"] = sorted(selected_now)
+        _sync_tree_checkbox_keys(tree, selected_now)
 
-    selected = st.multiselect(
-        "Folders to copy in this batch",
-        options=folders,
-        key="ms_folders",
-        help="Select any subset. Use Next batch to grab the next N remaining folders.",
-    )
-    if selected:
-        st.info(f"This batch will copy **{len(selected)}** folder(s).")
-    return selected
+    with st.container(border=True):
+        _render_tree_node(tree, tree)
+
+    selected_set = set(st.session_state.get("tree_selected", []))
+    roots = selection_roots(selected_set)
+    if roots:
+        st.info(
+            f"**{len(selected_set)}** folder(s) checked · "
+            f"**{len(roots)}** copy root(s) will be used "
+            f"(parent selection covers its subfolders)."
+        )
+    return roots
 
 
 def render_copy_from_iphone() -> None:
     st.subheader("Copy from iPhone → laptop")
     st.write(
-        "Select folders in batches, copy file-by-file (auto-skip failures), "
-        "and get an Excel log of anything that could not be copied."
+        "Select folders from the iPhone tree (parent check selects subfolders), "
+        "copy file-by-file with auto-skip, and get an Excel failure log."
     )
 
     if not is_windows():
@@ -197,8 +249,8 @@ def render_copy_from_iphone() -> None:
         return
 
     if refresh:
-        st.session_state["iphone_folders"] = []
-        st.session_state["ms_folders"] = []
+        st.session_state["iphone_tree"] = None
+        st.session_state["tree_selected"] = []
 
     if not devices:
         st.warning(
@@ -219,23 +271,28 @@ def render_copy_from_iphone() -> None:
     )
     st.session_state["selected_device"] = device
 
-    load = st.button("Load folders from iPhone", use_container_width=True)
+    load = st.button("Load folder tree from iPhone", use_container_width=True)
     if load:
         try:
-            with st.spinner("Reading folders from iPhone..."):
-                st.session_state["iphone_folders"] = list_iphone_media_folders(device)
-                st.session_state["ms_folders"] = []
+            with st.spinner("Reading folder tree from iPhone..."):
+                tree = list_iphone_folder_tree(device, max_depth=4)
+                st.session_state["iphone_tree"] = tree
+                st.session_state["tree_selected"] = []
+                _sync_tree_checkbox_keys(tree, set())
         except WindowsShellError as exc:
             st.error(str(exc))
-            st.session_state["iphone_folders"] = []
+            st.session_state["iphone_tree"] = None
 
-    folders = st.session_state.get("iphone_folders") or []
-    if folders:
-        st.success(f"Found {len(folders)} folders on the iPhone.")
-        selected_folders = render_batch_folder_picker(folders)
+    tree = st.session_state.get("iphone_tree")
+    if tree:
+        st.success(
+            f"Loaded tree for **{tree.get('name', 'Internal Storage')}** "
+            f"({count_folders(tree)} folders)."
+        )
+        selected_folders = render_folder_tree_picker(tree)
     else:
         selected_folders = []
-        st.info("Click **Load folders from iPhone** to list Internal Storage folders.")
+        st.info("Click **Load folder tree from iPhone** to browse folders with checkboxes.")
 
     destination = path_with_browse(
         label="Paste to folder on laptop",
@@ -270,11 +327,16 @@ def render_copy_from_iphone() -> None:
         "folder with source path, destination path, and error details."
     )
 
+    # selected_folders can be [""] for full root — treat as valid selection
+    has_selection = bool(selected_folders) or selected_folders == [""]
+    # selection_roots returns [""] when root checked — bool([""]) is True. Good.
+    # when nothing selected, roots is []. Good.
+
     do_copy = st.button(
-        "Copy this batch to laptop",
+        "Copy selected folders to laptop",
         type="primary",
         use_container_width=True,
-        disabled=not (selected_folders and destination),
+        disabled=not (has_selection and destination),
     )
 
     if not do_copy:
@@ -308,9 +370,16 @@ def render_copy_from_iphone() -> None:
         st.error(f"Copy failed: {exc}")
         return
 
-    # Mark batch folders completed in this session (for Next batch)
+    # Mark top-level folders from this selection as completed
     completed = set(st.session_state.get("completed_folders", []))
-    completed.update(selected_folders)
+    for path in selected_folders:
+        top = path.split("/", 1)[0] if path else ""
+        if top:
+            completed.add(top)
+        else:
+            # full root copy — mark all top-level children completed
+            for child in tree.get("children") or []:
+                completed.add(child["path"])
     st.session_state["completed_folders"] = sorted(completed)
 
     progress.progress(1.0, text="Batch finished")
