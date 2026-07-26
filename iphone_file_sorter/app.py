@@ -38,7 +38,7 @@ except Exception as exc:  # pragma: no cover
         return []
 
     def list_afc_folder_tree(_serial: str, *, max_depth: int = 2):
-        return {"name": "DCIM", "path": "DCIM", "children": []}
+        return {"name": "iPhone", "path": "", "children": []}
 
     def copy_afc_folders(*_args, **_kwargs):
         raise RuntimeError("AFC copy unavailable.")
