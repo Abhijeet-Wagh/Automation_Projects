@@ -86,6 +86,7 @@ if errorlevel 1 (
 
 echo.
 echo Installing / updating UI dependencies...
+echo (Includes pymobiledevice3 for real iPhone file copy via Apple AFC)
 "%PYEXE%" -m pip install -r requirements.txt
 if errorlevel 1 (
   echo Failed to install dependencies.

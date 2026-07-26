@@ -24,14 +24,17 @@ Sort files copied from an iPhone's **Internal Storage** (or any folder tree) int
 The UI has **two panels (tabs)**:
 
 ### 1. Copy files
-1. Click **Refresh devices** → select your iPhone → **Load folder tree from iPhone**
-2. Use the **checkbox tree** (parent check selects subfolders)
-3. **Browse** a laptop destination folder
-4. Click **Copy selected folders to laptop**
+Uses **Apple AFC** (via `pymobiledevice3`) to copy real files from iPhone `DCIM`.  
+Windows MTP/Explorer-style copy is avoided because it often creates **empty folders**.
+
+1. Install deps (Anaconda Prompt): `python -m pip install -r requirements.txt`
+2. Unlock iPhone → tap **Trust**
+3. **Refresh devices** → select iPhone → **Load DCIM folder tree**
+4. Check folders → **Browse** destination → **Copy selected folders to laptop**
 
 Behavior:
-- Copies **file-by-file**
-- Failed files are **skipped**; an **Excel log** is saved in the destination folder
+- Copies real photo/video files over USB
+- Failed files are skipped; an Excel log is saved in the destination folder
 
 ### 2. Sort files
 1. Open the **Sort files** tab

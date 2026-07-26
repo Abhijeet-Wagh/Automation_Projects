@@ -13,45 +13,41 @@ from pathlib import Path
 import streamlit as st
 
 from folder_picker import pick_folder
-from folder_tree import (
-    all_paths,
-    apply_check,
-    count_folders,
-    find_node,
-    selection_roots,
-)
+from folder_tree import all_paths, apply_check, count_folders, selection_roots
 from sort_files import CATEGORY_EXTENSIONS, categorize, iter_source_files, sort_files
 
 try:
-    from windows_iphone import (
-        WindowsShellError,
-        copy_folders_bulk,
-        copy_folders_file_by_file,
-        is_windows,
-        list_iphone_child_folders,
-        list_iphone_folder_tree,
-        list_portable_apple_devices,
+    from afc_iphone import (
+        AfcError,
+        afc_available,
+        copy_afc_folders,
+        list_afc_devices,
+        list_afc_folder_tree,
     )
-except Exception:  # pragma: no cover - import safety on non-Windows
-    WindowsShellError = RuntimeError  # type: ignore
+except Exception:  # pragma: no cover
+    AfcError = RuntimeError  # type: ignore
 
-    def is_windows() -> bool:
+    def afc_available() -> bool:
         return False
 
-    def list_portable_apple_devices() -> list[str]:
+    def list_afc_devices():
         return []
 
-    def list_iphone_folder_tree(_device_name: str, *, max_depth: int = 1):
-        return {"name": "Internal Storage", "path": "", "children": []}
+    def list_afc_folder_tree(_serial: str, *, max_depth: int = 2):
+        return {"name": "DCIM", "path": "DCIM", "children": []}
 
-    def list_iphone_child_folders(_device_name: str, _parent_rel_path: str):
-        return []
+    def copy_afc_folders(*_args, **_kwargs):
+        raise RuntimeError("AFC copy unavailable.")
 
-    def copy_folders_bulk(*_args, **_kwargs):
-        raise RuntimeError("iPhone copy is only available on Windows.")
 
-    def copy_folders_file_by_file(*_args, **_kwargs):
-        raise RuntimeError("iPhone copy is only available on Windows.")
+try:
+    from windows_iphone import is_windows
+except Exception:  # pragma: no cover
+
+    def is_windows() -> bool:
+        import sys
+
+        return sys.platform.startswith("win")
 
 
 st.set_page_config(
@@ -70,6 +66,7 @@ def _init_state() -> None:
         "sort_source": "",
         "sort_destination": "",
         "selected_device": "",
+        "afc_serial": "",
         "iphone_tree": None,
         "tree_selected": [],
         "completed_folders": [],
@@ -194,13 +191,17 @@ def _render_tree_node(node: dict, depth: int = 0) -> None:
         _render_tree_node(child, depth + 1)
 
 
-def render_folder_tree_picker(tree: dict, device_name: str) -> list[str]:
+def render_folder_tree_picker(
+    tree: dict,
+    device_name: str = "",
+    *,
+    allow_lazy_subfolders: bool = False,
+) -> list[str]:
     """Checkbox tree with parent→child cascade selection."""
     st.markdown("#### iPhone folder tree")
     st.caption(
-        "Top-level folders load first (fast). "
-        "Check a parent to select its visible subfolders. "
-        "Use **Load subfolders** only if you need deeper folders."
+        "Check a parent folder to select its subfolders. "
+        "Uncheck any folder you do not want to copy."
     )
 
     top_level = [c["path"] for c in (tree.get("children") or [])]
@@ -243,47 +244,8 @@ def render_folder_tree_picker(tree: dict, device_name: str) -> list[str]:
         st.session_state["completed_folders"] = []
         st.rerun()
 
-    # Lazy-load one level of subfolders for currently checked folders
-    if st.button(
-        "Load subfolders for checked folders",
-        use_container_width=True,
-        help=(
-            "Optional. Scans only checked folders for subfolders. "
-            "Can be slow on iPhone — prefer top-level selection when possible."
-        ),
-    ):
-        selected_paths = [
-            p for p in st.session_state.get("tree_selected", []) if p != ""
-        ]
-        if not selected_paths:
-            st.warning("Check one or more folders first, then load their subfolders.")
-        else:
-            try:
-                with st.spinner(
-                    f"Loading subfolders for {len(selected_paths)} folder(s). "
-                    "This may take a minute..."
-                ):
-                    for parent_path in selected_paths:
-                        node = find_node(tree, parent_path)
-                        if node is None:
-                            continue
-                        if node.get("children"):
-                            continue  # already loaded
-                        children = list_iphone_child_folders(device_name, parent_path)
-                        node["children"] = children
-                        # If parent is selected, auto-select new children
-                        if parent_path in st.session_state.get("tree_selected", []):
-                            selected = set(st.session_state["tree_selected"])
-                            selected.update(c["path"] for c in children)
-                            st.session_state["tree_selected"] = sorted(selected)
-                    st.session_state["iphone_tree"] = tree
-                    _sync_tree_checkbox_keys(
-                        tree, set(st.session_state.get("tree_selected", []))
-                    )
-                st.success("Subfolder scan finished.")
-                st.rerun()
-            except WindowsShellError as exc:
-                st.error(str(exc))
+    if allow_lazy_subfolders and device_name:
+        st.caption("Lazy MTP subfolder loading is disabled in AFC mode.")
 
     # Prune invalid selections if tree reloaded (before checkbox widgets exist)
     valid = set(all_paths(tree))
@@ -309,13 +271,17 @@ def render_folder_tree_picker(tree: dict, device_name: str) -> list[str]:
 
 def render_copy_from_iphone() -> None:
     st.write(
-        "Copy files from a connected **iPhone** to a folder on this laptop. "
-        "Select folders in the tree, choose where to paste, then start the copy."
+        "Copy **real photo/video files** from iPhone to this laptop using Apple AFC "
+        "(not Windows MTP — MTP often creates empty folders)."
     )
 
     if not is_windows():
-        st.error("Direct iPhone copy is supported on **Windows** only.")
-        return
+        st.warning("This copy panel is intended for Windows with iTunes/Apple Devices installed.")
+
+    st.info(
+        "Windows Explorer MTP copy is unreliable (empty folders). "
+        "This app now uses **Apple AFC** via pymobiledevice3 to pull actual files from DCIM."
+    )
 
     top = st.columns([1, 1])
     with top[0]:
@@ -323,60 +289,69 @@ def render_copy_from_iphone() -> None:
     with top[1]:
         st.caption("Unlock iPhone, tap Trust, keep screen awake.")
 
-    try:
-        devices = list_portable_apple_devices()
-    except WindowsShellError as exc:
-        st.error(str(exc))
-        return
-
     if refresh:
         st.session_state["iphone_tree"] = None
         st.session_state["tree_selected"] = []
+        st.session_state["afc_serial"] = ""
+
+    if not afc_available():
+        st.error(
+            "pymobiledevice3 is missing. In Anaconda Prompt run:\n\n"
+            "`python -m pip install pymobiledevice3`\n\n"
+            "Then restart the UI."
+        )
+        return
+
+    try:
+        devices = list_afc_devices()
+    except AfcError as exc:
+        st.error(str(exc))
+        return
 
     if not devices:
         st.warning(
-            "No iPhone/iPad found under **This PC**.\n\n"
-            "- Unlock the iPhone and tap **Trust**\n"
+            "No iPhone found over USB (AFC).\n\n"
+            "- Unlock iPhone and tap **Trust**\n"
             "- Use a data cable\n"
-            "- Open File Explorer and confirm the phone appears\n"
+            "- Keep **iTunes / Apple Devices** installed\n"
             "- Then click **Refresh devices**"
         )
         return
 
-    device = st.selectbox(
-        "iPhone / iPad (copy from)",
-        options=devices,
-        index=devices.index(st.session_state["selected_device"])
-        if st.session_state["selected_device"] in devices
-        else 0,
-    )
-    st.session_state["selected_device"] = device
+    labels = [f"{d['name']} ({d['serial']})" for d in devices]
+    serials = [d["serial"] for d in devices]
+    default_idx = 0
+    if st.session_state.get("afc_serial") in serials:
+        default_idx = serials.index(st.session_state["afc_serial"])
 
-    load = st.button("Load folder tree from iPhone", use_container_width=True)
+    choice = st.selectbox("iPhone (AFC)", options=labels, index=default_idx)
+    serial = serials[labels.index(choice)]
+    st.session_state["afc_serial"] = serial
+
+    load = st.button("Load DCIM folder tree from iPhone", use_container_width=True)
     if load:
         try:
-            with st.spinner(
-                "Reading top-level folders from iPhone (fast mode)..."
-            ):
-                # depth=1 only — deep scans hang on iPhone MTP photo folders
-                tree = list_iphone_folder_tree(device, max_depth=1)
+            with st.spinner("Reading DCIM folders via Apple AFC..."):
+                tree = list_afc_folder_tree(serial, max_depth=2)
                 st.session_state["iphone_tree"] = tree
                 st.session_state["tree_selected"] = []
                 _sync_tree_checkbox_keys(tree, set())
-        except WindowsShellError as exc:
+        except AfcError as exc:
             st.error(str(exc))
             st.session_state["iphone_tree"] = None
 
     tree = st.session_state.get("iphone_tree")
     if tree:
         st.success(
-            f"Loaded tree for **{tree.get('name', 'Internal Storage')}** "
-            f"({count_folders(tree)} folders)."
+            f"Loaded **{tree.get('name', 'DCIM')}** "
+            f"({count_folders(tree)} folders) via AFC."
         )
-        selected_folders = render_folder_tree_picker(tree, device)
+        selected_folders = render_folder_tree_picker(
+            tree, allow_lazy_subfolders=False
+        )
     else:
         selected_folders = []
-        st.info("Click **Load folder tree from iPhone** to browse folders with checkboxes.")
+        st.info("Click **Load DCIM folder tree from iPhone** to browse folders.")
 
     destination = path_with_browse(
         label="Paste to folder on laptop",
@@ -384,30 +359,6 @@ def render_copy_from_iphone() -> None:
         placeholder=r"C:\Users\YourName\Documents\iPhone_Copy",
         help_text="Files/folders from the iPhone will be copied here.",
     )
-
-    copy_mode = st.radio(
-        "Copy mode",
-        options=[
-            "Fast: whole folders (Windows copy dialog) — recommended",
-            "Detailed: file-by-file (slower, auto-skip + Excel log)",
-        ],
-        index=0,
-        help=(
-            "Fast mode copies each selected folder like File Explorer and shows the "
-            "Windows progress window. File-by-file mode is much slower on iPhone."
-        ),
-    )
-    use_file_by_file = copy_mode.startswith("Detailed")
-
-    file_timeout = 45
-    if use_file_by_file:
-        file_timeout = st.slider(
-            "Per-file wait timeout (seconds)",
-            min_value=15,
-            max_value=180,
-            value=30,
-            help="If a file doesn’t finish in time, it is skipped and logged.",
-        )
 
     also_sort = st.checkbox(
         "After copy, also sort into Images / Videos / Documents / Excel / PDF / Other",
@@ -422,22 +373,11 @@ def render_copy_from_iphone() -> None:
             help_text="Category folders will be created here after copying.",
         )
 
-    if use_file_by_file:
-        st.caption(
-            "File-by-file can look stuck on file 1/N for up to the timeout. "
-            "Keep the iPhone unlocked. Prefer Fast mode for large folders."
-        )
-    else:
-        st.caption(
-            "A Windows copy window should appear. If a file errors, click Skip and "
-            "let the rest continue. An Excel log of arrived files is saved at the end."
-        )
+    st.caption(
+        "AFC copies real files. Failed items are skipped and listed in an Excel log."
+    )
 
-    # selected_folders can be [""] for full root — treat as valid selection
-    has_selection = bool(selected_folders) or selected_folders == [""]
-    # selection_roots returns [""] when root checked — bool([""]) is True. Good.
-    # when nothing selected, roots is []. Good.
-
+    has_selection = bool(selected_folders)
     do_copy = st.button(
         "Copy selected folders to laptop",
         type="primary",
@@ -449,23 +389,13 @@ def render_copy_from_iphone() -> None:
         return
 
     dest_path = Path(destination).expanduser()
-    progress = st.progress(0, text="Starting copy...")
+    progress = st.progress(0, text="Starting AFC copy...")
     status = st.empty()
-    tip = st.empty()
-    tip.info(
-        "Keep the iPhone unlocked. "
-        + (
-            "Look behind the browser / on the taskbar for a Windows copy window. "
-            "Files should appear under your destination folder as it runs."
-            if not use_file_by_file
-            else f"Waiting up to {file_timeout}s per file, then auto-skip."
-        )
-    )
+    st.info("Keep the iPhone unlocked. Files should appear in the destination as they download.")
     st.write(f"Destination: `{dest_path}`")
 
     def on_progress(name: str, index: int, total: int, stage: str) -> None:
         fraction = 0 if total == 0 else index / max(total, 1)
-        # For waiting stage, show partial progress within the current item
         progress.progress(
             min(max(fraction, 0.0), 1.0),
             text=f"{index}/{total}: {stage} · {name}",
@@ -473,42 +403,22 @@ def render_copy_from_iphone() -> None:
         status.write(f"**{stage.title()}:** `{name}`")
 
     try:
-        if use_file_by_file:
-            with st.spinner("Copying file-by-file from iPhone..."):
-                result = copy_folders_file_by_file(
-                    device,
-                    selected_folders,
-                    dest_path,
-                    file_timeout_sec=float(file_timeout),
-                    on_progress=on_progress,
-                )
-        else:
-            with st.spinner(
-                "Copying whole folders via Windows dialog (this can take a while)..."
-            ):
-                result = copy_folders_bulk(
-                    device,
-                    selected_folders,
-                    dest_path,
-                    on_progress=on_progress,
-                )
-    except WindowsShellError as exc:
+        with st.spinner("Copying from iPhone via Apple AFC (real files)..."):
+            result = copy_afc_folders(
+                serial,
+                selected_folders,
+                dest_path,
+                on_progress=on_progress,
+            )
+    except AfcError as exc:
         st.error(str(exc))
         return
     except Exception as exc:  # noqa: BLE001
         st.error(f"Copy failed: {exc}")
         return
 
-    # Mark top-level folders from this selection as completed
     completed = set(st.session_state.get("completed_folders", []))
-    for path in selected_folders:
-        top = path.split("/", 1)[0] if path else ""
-        if top:
-            completed.add(top)
-        else:
-            # full root copy — mark all top-level children completed
-            for child in tree.get("children") or []:
-                completed.add(child["path"])
+    completed.update(selected_folders)
     st.session_state["completed_folders"] = sorted(completed)
 
     progress.progress(1.0, text="Batch finished")

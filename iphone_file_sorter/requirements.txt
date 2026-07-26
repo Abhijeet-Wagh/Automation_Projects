@@ -1,3 +1,4 @@
 streamlit>=1.32.0
 openpyxl>=3.1.0
+pymobiledevice3>=9.33.1
 pywin32>=306; platform_system=="Windows"
