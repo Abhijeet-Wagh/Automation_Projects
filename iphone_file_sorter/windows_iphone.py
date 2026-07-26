@@ -166,60 +166,65 @@ def list_iphone_media_folders(device_name: str) -> list[str]:
         raise WindowsShellError(f"Failed to list iPhone folders: {exc}") from exc
 
 
-def _build_folder_tree_node(
-    folder: Any,
-    *,
-    name: str,
-    rel_path: str,
-    max_depth: int,
-    depth: int,
-) -> dict[str, Any]:
-    children: list[dict[str, Any]] = []
-    if depth < max_depth:
-        folder_items = []
-        for item in list(folder.Items()):
-            if _is_folder_item(item):
-                folder_items.append(item)
-        folder_items.sort(key=lambda it: str(it.Name).lower())
-        for item in folder_items:
-            child_name = str(item.Name)
-            child_rel = f"{rel_path}/{child_name}" if rel_path else child_name
-            child_folder = item.GetFolder
-            if child_folder is None:
-                continue
-            children.append(
-                _build_folder_tree_node(
-                    child_folder,
-                    name=child_name,
-                    rel_path=child_rel,
-                    max_depth=max_depth,
-                    depth=depth + 1,
-                )
-            )
-    return {"name": name, "path": rel_path, "children": children}
-
-
-def list_iphone_folder_tree(device_name: str, *, max_depth: int = 4) -> dict[str, Any]:
+def _immediate_child_folder_nodes(folder: Any, parent_rel: str) -> list[dict[str, Any]]:
     """
-    Return a nested folder tree under Internal Storage.
+    List only immediate child folders (no recursion).
 
-    Root node path is "" (empty string). Child paths are relative to that root,
-    e.g. "202403_b" or "Documents/MyApp".
+    Important: do not walk into media folders by default — on iPhone MTP,
+    enumerating files inside each dated folder can hang for a long time.
+    """
+    nodes: list[dict[str, Any]] = []
+    for item in list(folder.Items()):
+        if not _is_folder_item(item):
+            continue
+        child_name = str(item.Name)
+        child_rel = f"{parent_rel}/{child_name}" if parent_rel else child_name
+        nodes.append({"name": child_name, "path": child_rel, "children": []})
+    nodes.sort(key=lambda n: n["name"].lower())
+    return nodes
+
+
+def list_iphone_folder_tree(device_name: str, *, max_depth: int = 1) -> dict[str, Any]:
+    """
+    Return a folder tree under Internal Storage.
+
+    Default max_depth=1 loads only top-level folders (fast).
+    Deeper levels should be loaded lazily with list_iphone_child_folders().
     """
     try:
         with _com_initialized():
             root, media_label = find_internal_storage(device_name)
-            return _build_folder_tree_node(
-                root,
-                name=media_label,
-                rel_path="",
-                max_depth=max_depth,
-                depth=0,
-            )
+            if max_depth <= 0:
+                return {"name": media_label, "path": "", "children": []}
+
+            children = _immediate_child_folder_nodes(root, "")
+            # max_depth > 1 is supported but can be very slow on iPhone MTP
+            if max_depth > 1:
+                for child in children:
+                    child_folder = get_folder_by_rel_path(root, child["path"])
+                    child["children"] = _immediate_child_folder_nodes(
+                        child_folder, child["path"]
+                    )
+            return {"name": media_label, "path": "", "children": children}
     except WindowsShellError:
         raise
     except Exception as exc:  # noqa: BLE001
         raise WindowsShellError(f"Failed to build iPhone folder tree: {exc}") from exc
+
+
+def list_iphone_child_folders(device_name: str, parent_rel_path: str) -> list[dict[str, Any]]:
+    """Lazy-load immediate subfolders under one parent path."""
+    try:
+        with _com_initialized():
+            root, _media_label = find_internal_storage(device_name)
+            parent = get_folder_by_rel_path(root, parent_rel_path)
+            return _immediate_child_folder_nodes(parent, parent_rel_path)
+    except WindowsShellError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise WindowsShellError(
+            f"Failed to list subfolders for '{parent_rel_path or 'root'}': {exc}"
+        ) from exc
 
 
 def get_folder_by_rel_path(media_root: Any, rel_path: str) -> Any:

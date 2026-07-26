@@ -13,7 +13,13 @@ from pathlib import Path
 import streamlit as st
 
 from folder_picker import pick_folder
-from folder_tree import all_paths, apply_check, count_folders, selection_roots
+from folder_tree import (
+    all_paths,
+    apply_check,
+    count_folders,
+    find_node,
+    selection_roots,
+)
 from sort_files import CATEGORY_EXTENSIONS, categorize, iter_source_files, sort_files
 
 try:
@@ -21,6 +27,7 @@ try:
         WindowsShellError,
         copy_folders_file_by_file,
         is_windows,
+        list_iphone_child_folders,
         list_iphone_folder_tree,
         list_portable_apple_devices,
     )
@@ -33,8 +40,11 @@ except Exception:  # pragma: no cover - import safety on non-Windows
     def list_portable_apple_devices() -> list[str]:
         return []
 
-    def list_iphone_folder_tree(_device_name: str, *, max_depth: int = 4):
+    def list_iphone_folder_tree(_device_name: str, *, max_depth: int = 1):
         return {"name": "Internal Storage", "path": "", "children": []}
+
+    def list_iphone_child_folders(_device_name: str, _parent_rel_path: str):
+        return []
 
     def copy_folders_file_by_file(*_args, **_kwargs):
         raise RuntimeError("iPhone copy is only available on Windows.")
@@ -156,12 +166,13 @@ def _render_tree_node(node: dict, tree_root: dict, depth: int = 0) -> None:
         _render_tree_node(child, tree_root, depth + 1)
 
 
-def render_folder_tree_picker(tree: dict) -> list[str]:
+def render_folder_tree_picker(tree: dict, device_name: str) -> list[str]:
     """Checkbox tree with parent→child cascade selection."""
     st.markdown("#### iPhone folder tree")
     st.caption(
-        "Check a top folder to select all subfolders automatically. "
-        "You can still uncheck individual folders."
+        "Top-level folders load first (fast). "
+        "Check a parent to select its visible subfolders. "
+        "Use **Load subfolders** only if you need deeper folders."
     )
 
     top_level = [c["path"] for c in (tree.get("children") or [])]
@@ -190,7 +201,7 @@ def render_folder_tree_picker(tree: dict) -> list[str]:
         st.rerun()
     if b2.button("Next batch", use_container_width=True):
         batch = remaining[: int(batch_size)]
-        selected: set[str] = set()
+        selected = set()
         for path in batch:
             selected = apply_check(selected, tree, path, True)
         st.session_state["tree_selected"] = sorted(selected)
@@ -203,6 +214,48 @@ def render_folder_tree_picker(tree: dict) -> list[str]:
     if b4.button("Reset completed", use_container_width=True):
         st.session_state["completed_folders"] = []
         st.rerun()
+
+    # Lazy-load one level of subfolders for currently checked folders
+    if st.button(
+        "Load subfolders for checked folders",
+        use_container_width=True,
+        help=(
+            "Optional. Scans only checked folders for subfolders. "
+            "Can be slow on iPhone — prefer top-level selection when possible."
+        ),
+    ):
+        selected_paths = [
+            p for p in st.session_state.get("tree_selected", []) if p != ""
+        ]
+        if not selected_paths:
+            st.warning("Check one or more folders first, then load their subfolders.")
+        else:
+            try:
+                with st.spinner(
+                    f"Loading subfolders for {len(selected_paths)} folder(s). "
+                    "This may take a minute..."
+                ):
+                    for parent_path in selected_paths:
+                        node = find_node(tree, parent_path)
+                        if node is None:
+                            continue
+                        if node.get("children"):
+                            continue  # already loaded
+                        children = list_iphone_child_folders(device_name, parent_path)
+                        node["children"] = children
+                        # If parent is selected, auto-select new children
+                        if parent_path in st.session_state.get("tree_selected", []):
+                            selected = set(st.session_state["tree_selected"])
+                            selected.update(c["path"] for c in children)
+                            st.session_state["tree_selected"] = sorted(selected)
+                    st.session_state["iphone_tree"] = tree
+                    _sync_tree_checkbox_keys(
+                        tree, set(st.session_state.get("tree_selected", []))
+                    )
+                st.success("Subfolder scan finished.")
+                st.rerun()
+            except WindowsShellError as exc:
+                st.error(str(exc))
 
     # Prune invalid selections if tree reloaded
     valid = set(all_paths(tree))
@@ -274,8 +327,11 @@ def render_copy_from_iphone() -> None:
     load = st.button("Load folder tree from iPhone", use_container_width=True)
     if load:
         try:
-            with st.spinner("Reading folder tree from iPhone..."):
-                tree = list_iphone_folder_tree(device, max_depth=4)
+            with st.spinner(
+                "Reading top-level folders from iPhone (fast mode)..."
+            ):
+                # depth=1 only — deep scans hang on iPhone MTP photo folders
+                tree = list_iphone_folder_tree(device, max_depth=1)
                 st.session_state["iphone_tree"] = tree
                 st.session_state["tree_selected"] = []
                 _sync_tree_checkbox_keys(tree, set())
@@ -289,7 +345,7 @@ def render_copy_from_iphone() -> None:
             f"Loaded tree for **{tree.get('name', 'Internal Storage')}** "
             f"({count_folders(tree)} folders)."
         )
-        selected_folders = render_folder_tree_picker(tree)
+        selected_folders = render_folder_tree_picker(tree, device)
     else:
         selected_folders = []
         st.info("Click **Load folder tree from iPhone** to browse folders with checkboxes.")
