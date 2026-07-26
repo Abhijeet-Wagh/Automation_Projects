@@ -401,11 +401,17 @@ def render_folder_tree_picker(
         f"{len(remaining)} top-level remaining"
     )
 
+    batch_max = max(1, len(top_level) or 1)
+    batch_default = min(int(st.session_state.get("batch_size", 5)), batch_max)
+    batch_default = max(1, batch_default)
+    # Keep session value in range before the widget is created (Streamlit
+    # raises if value > max_value, e.g. old default 5 with only 2 top folders).
+    st.session_state["batch_size"] = batch_default
     batch_size = st.number_input(
         "Batch size (for Next batch)",
         min_value=1,
-        max_value=max(1, len(top_level) or 1),
-        value=int(st.session_state.get("batch_size", 5)),
+        max_value=batch_max,
+        value=batch_default,
         step=1,
         help="Select the next N remaining top-level folders (and their subfolders).",
     )
