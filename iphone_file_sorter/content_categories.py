@@ -194,8 +194,10 @@ CATEGORIES: list[ContentCategory] = [
             "Can make backup much slower — try Contacts alone first if a run hangs."
         ),
         kind="backup",
+        # Keep these narrow — a bare "Notes" match pulls far too much and can hang.
         backup_regexes=(
-            r"(?i)Notes",
+            r"(?i)HomeDomain/.*/Notes/",
+            r"(?i)AppDomainGroup-group\.com\.apple\.notes",
             r"(?i)group\.com\.apple\.notes",
         ),
         default_on=False,

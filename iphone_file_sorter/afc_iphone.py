@@ -1040,71 +1040,69 @@ async def _copy_folders_async(
             # remaining files (already-handled remotes are skipped).
             completed_target = False
             for _pass in range(8):
-                lockdown = None
                 try:
-                    lockdown = await create_using_usbmux(serial=serial)
-                    await lockdown.__aenter__()
-                    device_name = str(
-                        getattr(lockdown, "display_name", None) or serial
-                    )
-
-                    if parsed["kind"] == "media":
-                        file_index, needs_reconnect = await _copy_media_folder(
-                            lockdown,
-                            parsed["remote"],
-                            destination,
-                            device_name=device_name,
-                            logical_folder=logical,
-                            on_progress=on_progress,
-                            succeeded=succeeded,
-                            failed=failed,
-                            file_index_start=file_index,
-                            file_total=0,
-                            handled_remotes=handled_remotes,
-                            allowed_extensions=allowed_extensions,
-                            filter_stats=filter_stats,
+                    async with await create_using_usbmux(serial=serial) as lockdown:
+                        device_name = str(
+                            getattr(lockdown, "display_name", None) or serial
                         )
-                        if needs_reconnect:
-                            continue
+
+                        if parsed["kind"] == "media":
+                            file_index, needs_reconnect = await _copy_media_folder(
+                                lockdown,
+                                parsed["remote"],
+                                destination,
+                                device_name=device_name,
+                                logical_folder=logical,
+                                on_progress=on_progress,
+                                succeeded=succeeded,
+                                failed=failed,
+                                file_index_start=file_index,
+                                file_total=0,
+                                handled_remotes=handled_remotes,
+                                allowed_extensions=allowed_extensions,
+                                filter_stats=filter_stats,
+                            )
+                            if needs_reconnect:
+                                continue
+                            completed_target = True
+                            break
+
+                        if parsed["kind"] == "app" and parsed["bundle_id"]:
+                            file_index, needs_reconnect = await _copy_app_folder(
+                                lockdown,
+                                parsed["bundle_id"],
+                                parsed["remote"],
+                                destination,
+                                device_name=device_name,
+                                logical_folder=logical,
+                                on_progress=on_progress,
+                                succeeded=succeeded,
+                                failed=failed,
+                                file_index_start=file_index,
+                                file_total=max(file_index + 1, 1),
+                                allowed_extensions=allowed_extensions,
+                                filter_stats=filter_stats,
+                            )
+                            if needs_reconnect:
+                                continue
+                            completed_target = True
+                            break
+
+                        failed.append(
+                            {
+                                "timestamp": _now(),
+                                "device": device_name,
+                                "source_folder": logical,
+                                "file_name": "",
+                                "relative_path": "",
+                                "source_path": logical,
+                                "destination_path": str(destination),
+                                "error": "Nothing to copy for this tree node",
+                                "status": "Skipped",
+                            }
+                        )
                         completed_target = True
                         break
-
-                    if parsed["kind"] == "app" and parsed["bundle_id"]:
-                        file_index, needs_reconnect = await _copy_app_folder(
-                            lockdown,
-                            parsed["bundle_id"],
-                            parsed["remote"],
-                            destination,
-                            device_name=device_name,
-                            logical_folder=logical,
-                            on_progress=on_progress,
-                            succeeded=succeeded,
-                            failed=failed,
-                            file_index_start=file_index,
-                            file_total=max(file_index + 1, 1),
-                            allowed_extensions=allowed_extensions,
-                            filter_stats=filter_stats,
-                        )
-                        if needs_reconnect:
-                            continue
-                        completed_target = True
-                        break
-
-                    failed.append(
-                        {
-                            "timestamp": _now(),
-                            "device": device_name,
-                            "source_folder": logical,
-                            "file_name": "",
-                            "relative_path": "",
-                            "source_path": logical,
-                            "destination_path": str(destination),
-                            "error": "Nothing to copy for this tree node",
-                            "status": "Skipped",
-                        }
-                    )
-                    completed_target = True
-                    break
                 except Exception as exc:  # noqa: BLE001
                     if on_progress:
                         on_progress(
@@ -1115,12 +1113,6 @@ async def _copy_folders_async(
                         )
                     await asyncio.sleep(1.0)
                     continue
-                finally:
-                    if lockdown is not None:
-                        try:
-                            await lockdown.__aexit__(None, None, None)
-                        except Exception:
-                            pass
 
             if not completed_target:
                 failed.append(

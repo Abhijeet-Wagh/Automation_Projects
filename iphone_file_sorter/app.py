@@ -612,16 +612,32 @@ def render_copy_from_iphone() -> None:
     try:
         devices = list_afc_devices()
     except AfcError as exc:
-        st.error(str(exc))
+        detail = str(exc).strip() or repr(exc)
+        st.error(detail)
+        st.info(
+            "After removing an MDM/configuration profile, USB trust is often reset.\n\n"
+            "1. Unlock iPhone → unplug/replug USB → tap **Trust**\n"
+            "2. If no Trust prompt: **Settings → General → Transfer or Reset iPhone → "
+            "Reset → Reset Location & Privacy**, then reconnect and Trust\n"
+            "3. Restart Apple Mobile Device Service **as Administrator** "
+            "(double-click `Restart_Apple_Mobile_Device_Service.bat`, or use an Admin CMD)\n"
+            "4. Test with: `pymobiledevice3 usbmux list`"
+        )
         return
 
     if not devices:
         st.warning(
             "No iPhone found over USB (AFC).\n\n"
-            "- Unlock iPhone and tap **Trust**\n"
-            "- Use a data cable\n"
-            "- Keep **iTunes / Apple Devices** installed\n"
-            "- Then click **Refresh devices**"
+            "- Unlock iPhone and tap **Trust This Computer**\n"
+            "- Use a data cable / different USB port\n"
+            "- Keep **Apple Devices** or **iTunes** installed\n"
+            "- If you just removed an MDM profile, reset Location & Privacy and Trust again\n"
+            "- Restart Apple Mobile Device Service using "
+            "`Restart_Apple_Mobile_Device_Service.bat` (**Run as administrator** — "
+            "normal Anaconda Prompt gives *Access is denied*)\n"
+            "- Then click **Refresh devices**\n\n"
+            "File Explorer may still hide the phone; this app only needs AFC "
+            "(`pymobiledevice3 usbmux list`)."
         )
         return
 
