@@ -165,6 +165,54 @@ def _init_state() -> None:
             st.session_state[key] = value
 
 
+def _inject_tree_scroll_styles() -> None:
+    """Force a visible vertical scrollbar on the folder-tree box.
+
+    Streamlit uses overflow:auto, and Windows often hides overlay scrollbars
+    until you hover/scroll. This CSS keeps a clear scrollbar track + thumb.
+    """
+    st.markdown(
+        """
+<style>
+/* Target Streamlit keyed container (key="iphone_folder_tree") */
+div.st-key-iphone_folder_tree,
+div[class*="st-key-iphone_folder_tree"],
+div[data-testid="stVerticalBlockBorderWrapper"]:has(.iphone-tree-scroll-marker) {
+  height: 420px !important;
+  max-height: 420px !important;
+  overflow-y: scroll !important;
+  overflow-x: hidden !important;
+  scrollbar-gutter: stable;
+  scrollbar-width: auto; /* Firefox */
+  scrollbar-color: #4b5563 #d1d5db;
+}
+
+/* Chromium / Edge — always show a thick, obvious scrollbar */
+div.st-key-iphone_folder_tree::-webkit-scrollbar,
+div[class*="st-key-iphone_folder_tree"]::-webkit-scrollbar,
+div[data-testid="stVerticalBlockBorderWrapper"]:has(.iphone-tree-scroll-marker)::-webkit-scrollbar {
+  width: 14px;
+  -webkit-appearance: none;
+}
+div.st-key-iphone_folder_tree::-webkit-scrollbar-track,
+div[class*="st-key-iphone_folder_tree"]::-webkit-scrollbar-track,
+div[data-testid="stVerticalBlockBorderWrapper"]:has(.iphone-tree-scroll-marker)::-webkit-scrollbar-track {
+  background: #d1d5db;
+}
+div.st-key-iphone_folder_tree::-webkit-scrollbar-thumb,
+div[class*="st-key-iphone_folder_tree"]::-webkit-scrollbar-thumb,
+div[data-testid="stVerticalBlockBorderWrapper"]:has(.iphone-tree-scroll-marker)::-webkit-scrollbar-thumb {
+  background: #4b5563;
+  border-radius: 7px;
+  border: 2px solid #d1d5db;
+  min-height: 40px;
+}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def path_with_browse(label: str, state_key: str, placeholder: str, help_text: str) -> str:
     """
     Text path + Browse button.
@@ -415,9 +463,31 @@ def render_folder_tree_picker(
     # Keep widget keys in sync before instantiating checkboxes
     _sync_tree_checkbox_keys(tree, set(st.session_state.get("tree_selected", [])))
 
-    st.caption("Scroll inside the box below when the folder list is long.")
-    # Fixed-height bordered box enables an internal scrollbar
-    with st.container(border=True, height=420):
+    st.caption(
+        "Folder list is inside the box below — use the **vertical scrollbar on the right** "
+        "when the tree is taller than the box."
+    )
+    _inject_tree_scroll_styles()
+    # Fixed-height bordered box + CSS force a visible vertical scrollbar
+    try:
+        tree_box = st.container(
+            border=True,
+            height=420,
+            key="iphone_folder_tree",
+            autoscroll=False,
+        )
+    except TypeError:
+        # Older Streamlit: height/key/autoscroll may be missing
+        try:
+            tree_box = st.container(border=True, height=420)
+        except TypeError:
+            tree_box = st.container()
+
+    with tree_box:
+        st.markdown(
+            '<div class="iphone-tree-scroll-marker" style="display:none"></div>',
+            unsafe_allow_html=True,
+        )
         _render_tree_node(tree)
 
     selected_set = set(st.session_state.get("tree_selected", []))
