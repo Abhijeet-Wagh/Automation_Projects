@@ -62,6 +62,7 @@ CATEGORY_ORDER = ("Images", "Videos", "Documents", "Excel", "PDF", "Other")
 def _init_state() -> None:
     defaults = {
         "copy_destination": "",
+        "copy_sort_destination": "",
         "sort_source": "",
         "sort_destination": "",
         "selected_device": "",
@@ -76,6 +77,17 @@ def _init_state() -> None:
 
 
 def path_with_browse(label: str, state_key: str, placeholder: str, help_text: str) -> str:
+    """
+    Text path + Browse button.
+
+    Browse cannot write directly to the text_input key after that widget is
+    created, so we stash the chosen path in a pending key and apply it on the
+    next run before the text_input is instantiated.
+    """
+    pending_key = f"_pending_path_{state_key}"
+    if pending_key in st.session_state:
+        st.session_state[state_key] = st.session_state.pop(pending_key)
+
     col_path, col_btn = st.columns([4, 1])
     with col_path:
         value = st.text_input(
@@ -98,9 +110,9 @@ def path_with_browse(label: str, state_key: str, placeholder: str, help_text: st
             else:
                 selected = pick_folder(title=f"Select {label.lower()}")
                 if selected:
-                    st.session_state[state_key] = selected
+                    st.session_state[pending_key] = selected
                     st.rerun()
-    return value.strip() if value else ""
+    return (value or "").strip()
 
 
 def preview_counts(source: Path) -> dict[str, int]:
@@ -385,7 +397,7 @@ def render_copy_from_iphone() -> None:
     if also_sort:
         sort_destination = path_with_browse(
             label="Sorted output folder",
-            state_key="sort_destination",
+            state_key="copy_sort_destination",
             placeholder=r"C:\Users\YourName\Documents\iPhone_Sorted",
             help_text="Category folders will be created here after copying.",
         )
