@@ -8,6 +8,8 @@ Launch:
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import streamlit as st
@@ -16,6 +18,7 @@ from folder_picker import pick_folder
 from folder_tree import all_paths, apply_check, count_folders, selection_roots
 from sort_files import CATEGORY_EXTENSIONS, categorize, iter_source_files, sort_files
 
+_AFC_IMPORT_ERROR = ""
 try:
     from afc_iphone import (
         AfcError,
@@ -24,7 +27,8 @@ try:
         list_afc_devices,
         list_afc_folder_tree,
     )
-except Exception:  # pragma: no cover
+except Exception as exc:  # pragma: no cover
+    _AFC_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
     AfcError = RuntimeError  # type: ignore
 
     def afc_available() -> bool:
@@ -45,9 +49,40 @@ try:
 except Exception:  # pragma: no cover
 
     def is_windows() -> bool:
-        import sys
-
         return sys.platform.startswith("win")
+
+
+def _python_exe() -> str:
+    return sys.executable or "python"
+
+
+def _pymobiledevice3_status() -> tuple[bool, str]:
+    """Return (ok, detail) for the Python running this Streamlit app."""
+    if _AFC_IMPORT_ERROR:
+        return False, f"Could not import afc_iphone: {_AFC_IMPORT_ERROR}"
+    try:
+        import pymobiledevice3  # noqa: F401
+
+        return True, f"pymobiledevice3 is available in `{_python_exe()}`"
+    except ImportError as exc:
+        return False, f"pymobiledevice3 not found in `{_python_exe()}`: {exc}"
+
+
+def _install_pymobiledevice3() -> tuple[bool, str]:
+    cmd = [_python_exe(), "-m", "pip", "install", "-U", "pymobiledevice3"]
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Failed to run pip: {exc}"
+    output = (completed.stdout or "") + "\n" + (completed.stderr or "")
+    if completed.returncode == 0:
+        return True, output.strip() or "Install finished."
+    return False, output.strip() or f"pip exit code {completed.returncode}"
 
 
 st.set_page_config(
@@ -294,11 +329,30 @@ def render_copy_from_iphone() -> None:
         st.session_state["tree_selected"] = []
         st.session_state["afc_serial"] = ""
 
-    if not afc_available():
-        st.error(
-            "pymobiledevice3 is missing. In Anaconda Prompt run:\n\n"
-            "`python -m pip install pymobiledevice3`\n\n"
-            "Then restart the UI."
+    ok, detail = _pymobiledevice3_status()
+    if not ok or not afc_available():
+        st.error("Apple AFC support is not ready in the Python that is running this UI.")
+        st.code(detail, language="text")
+        st.write(f"This UI is running with: `{_python_exe()}`")
+        st.write("Install into **this exact Python** using the button below, or run:")
+        st.code(
+            f'"{_python_exe()}" -m pip install -U pymobiledevice3',
+            language="bash",
+        )
+        if st.button("Install pymobiledevice3 into this Python", type="primary"):
+            with st.spinner("Installing pymobiledevice3..."):
+                success, output = _install_pymobiledevice3()
+            if success:
+                st.success(
+                    "Install finished. Stop the app (Ctrl+C), start it again, then refresh."
+                )
+            else:
+                st.error("Install failed. See output below.")
+            st.code(output[-4000:] if output else "(no output)", language="text")
+        st.caption(
+            "Important: install and run Streamlit with the same Anaconda Python. "
+            "If you installed in one environment but launched Streamlit from another, "
+            "this error will continue."
         )
         return
 
