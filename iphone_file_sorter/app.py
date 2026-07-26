@@ -158,8 +158,7 @@ def _on_tree_checkbox_change(path: str) -> None:
     _sync_tree_checkbox_keys(tree, updated)
 
 
-def _render_tree_node(node: dict, tree_root: dict, depth: int = 0) -> None:
-    del tree_root  # cascade uses session tree via on_change
+def _render_tree_node(node: dict, depth: int = 0) -> None:
     path = node["path"]
     children = node.get("children") or []
     indent = "  " * depth  # em-space indent for tree levels
@@ -176,7 +175,7 @@ def _render_tree_node(node: dict, tree_root: dict, depth: int = 0) -> None:
     )
 
     for child in children:
-        _render_tree_node(child, node, depth + 1)
+        _render_tree_node(child, depth + 1)
 
 
 def render_folder_tree_picker(tree: dict, device_name: str) -> list[str]:
@@ -279,7 +278,7 @@ def render_folder_tree_picker(tree: dict, device_name: str) -> list[str]:
     _sync_tree_checkbox_keys(tree, set(st.session_state.get("tree_selected", [])))
 
     with st.container(border=True):
-        _render_tree_node(tree, tree)
+        _render_tree_node(tree)
 
     selected_set = set(st.session_state.get("tree_selected", []))
     roots = selection_roots(selected_set)
