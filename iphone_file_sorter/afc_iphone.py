@@ -286,8 +286,10 @@ def list_afc_devices() -> list[dict[str, str]]:
         return _run(_list_devices_async())
     except Exception as exc:  # noqa: BLE001
         raise AfcError(
-            f"Could not list iPhone via Apple drivers: {exc}. "
-            "Unlock the iPhone, tap Trust, and ensure iTunes/Apple Devices is installed."
+            f"Could not list iPhone via Apple drivers: {_format_exc(exc)}. "
+            "Unlock the iPhone, tap Trust, and ensure iTunes/Apple Devices is installed. "
+            "If Access is denied when restarting the Apple service, run "
+            "Restart_Apple_Mobile_Device_Service.bat as Administrator."
         ) from exc
 
 
