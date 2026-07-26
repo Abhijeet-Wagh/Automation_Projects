@@ -143,6 +143,7 @@ class AfcCopyResult:
     failed: list[dict[str, Any]] = field(default_factory=list)
     log_path: Path | None = None
     selected_folders: list[str] = field(default_factory=list)
+    filtered_out: int = 0  # excluded by extension allow-list (not logged per-file)
 
 
 def _now() -> str:
@@ -516,6 +517,12 @@ async def _pull_file(afc, remote_file: str, local_file: Path) -> None:
         pulled.replace(local_file)
 
 
+def _ext_allowed(remote_file: str, allowed_extensions: set[str] | None) -> bool:
+    if not allowed_extensions:
+        return True
+    return Path(remote_file).suffix.lower() in allowed_extensions
+
+
 async def _copy_one_remote_file(
     afc,
     *,
@@ -531,6 +538,8 @@ async def _copy_one_remote_file(
     succeeded: list,
     failed: list,
     handled_remotes: set[str],
+    allowed_extensions: set[str] | None = None,
+    filter_stats: dict[str, int] | None = None,
 ) -> str:
     """
     Copy a single remote file. Returns:
@@ -542,29 +551,19 @@ async def _copy_one_remote_file(
     prog_total = max(folder_total, 1)
     prog_index = min(folder_index, prog_total)
 
-    if _should_skip_remote(remote_file):
+    if _should_skip_remote(remote_file) or not _ext_allowed(remote_file, allowed_extensions):
         handled_remotes.add(remote_file)
-        failed.append(
-            {
-                "timestamp": _now(),
-                "device": device_name,
-                "source_folder": logical_folder,
-                "file_name": Path(remote_file).name,
-                "relative_path": remote_file,
-                "source_path": remote_file,
-                "destination_path": str(local_file),
-                "error": "Skipped system cache/DB file",
-                "status": "Skipped",
-            }
-        )
-        if on_progress:
+        # Extension / system filters are expected noise — count quietly, don't fill the log.
+        if filter_stats is not None:
+            filter_stats["filtered_out"] = int(filter_stats.get("filtered_out", 0)) + 1
+        if on_progress and file_index % 25 == 0:
             on_progress(
-                f"[folder {folder_index}/{folder_total}] {label} (system file skipped) · files {file_index}",
+                f"[folder {folder_index}/{folder_total}] scanning… skipped junk/non-matching · files {file_index}",
                 prog_index,
                 prog_total,
-                "skipped",
+                "scanning",
             )
-        return "skipped"
+        return "filtered"
 
     try:
         remote_size = await _stat_size(afc, remote_file)
@@ -712,6 +711,8 @@ async def _copy_media_folder(
     file_index_start: int,
     file_total: int,
     handled_remotes: set[str],
+    allowed_extensions: set[str] | None = None,
+    filter_stats: dict[str, int] | None = None,
 ) -> tuple[int, bool]:
     """
     Copy one media folder file-by-file with timeouts.
@@ -786,6 +787,8 @@ async def _copy_media_folder(
                         succeeded=succeeded,
                         failed=failed,
                         handled_remotes=handled_remotes,
+                        allowed_extensions=allowed_extensions,
+                        filter_stats=filter_stats,
                     )
                     if result in {"timeout", "disconnect"}:
                         return file_index, True
@@ -822,6 +825,8 @@ async def _copy_app_folder(
     failed: list,
     file_index_start: int,
     file_total: int,
+    allowed_extensions: set[str] | None = None,
+    filter_stats: dict[str, int] | None = None,
 ) -> tuple[int, bool]:
     from pymobiledevice3.services.house_arrest import HouseArrestService
 
@@ -846,6 +851,15 @@ async def _copy_app_folder(
                     rel = remote_file.lstrip("./")
                     local_file = app_dest_root / rel
                     label = f"{bundle_id}:{remote_file}"
+
+                    if _should_skip_remote(remote_file) or not _ext_allowed(
+                        remote_file, allowed_extensions
+                    ):
+                        if filter_stats is not None:
+                            filter_stats["filtered_out"] = (
+                                int(filter_stats.get("filtered_out", 0)) + 1
+                            )
+                        continue
 
                     try:
                         remote_size = await _stat_size(ha, remote_file)
@@ -983,6 +997,8 @@ async def _copy_folders_async(
     destination: Path,
     *,
     on_progress: Callable[[str, int, int, str], None] | None = None,
+    allowed_extensions: set[str] | None = None,
+    filter_stats: dict[str, int] | None = None,
 ) -> AfcCopyResult:
     from pymobiledevice3.lockdown import create_using_usbmux
 
@@ -994,6 +1010,8 @@ async def _copy_folders_async(
     failed: list[dict[str, Any]] = []
     device_name = serial
     targets = _expand_copy_targets(folder_paths)
+    if filter_stats is None:
+        filter_stats = {"filtered_out": 0}
 
     # No upfront file count — that walked the whole phone and looked "stuck".
     # Copy starts immediately; progress is per folder + running file count.
@@ -1042,6 +1060,8 @@ async def _copy_folders_async(
                             file_index_start=file_index,
                             file_total=0,
                             handled_remotes=handled_remotes,
+                            allowed_extensions=allowed_extensions,
+                            filter_stats=filter_stats,
                         )
                         if needs_reconnect:
                             continue
@@ -1061,6 +1081,8 @@ async def _copy_folders_async(
                             failed=failed,
                             file_index_start=file_index,
                             file_total=max(file_index + 1, 1),
+                            allowed_extensions=allowed_extensions,
+                            filter_stats=filter_stats,
                         )
                         if needs_reconnect:
                             continue
@@ -1131,6 +1153,7 @@ async def _copy_folders_async(
         failed=failed,
         log_path=log_path,
         selected_folders=list(folder_paths),
+        filtered_out=int(filter_stats.get("filtered_out", 0)),
     )
 
 
@@ -1140,6 +1163,7 @@ def copy_afc_folders(
     destination: Path,
     *,
     on_progress: Callable[[str, int, int, str], None] | None = None,
+    allowed_extensions: set[str] | None = None,
 ) -> AfcCopyResult:
     if not folder_paths:
         return AfcCopyResult(selected_folders=[])
@@ -1154,9 +1178,268 @@ def copy_afc_folders(
                 folder_paths,
                 destination,
                 on_progress=on_progress,
+                allowed_extensions=allowed_extensions,
             )
         )
     except AfcError:
         raise
     except Exception as exc:  # noqa: BLE001
         raise AfcError(f"AFC copy failed: {_format_exc(exc)}") from exc
+
+
+def _safe_dir_name(label: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_", " "} else "_" for ch in label)
+    return cleaned.strip().replace(" ", "_")[:80] or "Content"
+
+
+async def _backup_selections_async(
+    serial: str,
+    backup_directory: Path,
+    *,
+    selections: list[str],
+    regexes: list[str],
+    password: str,
+    on_progress: Callable[[str, int, int, str], None] | None,
+) -> None:
+    from pymobiledevice3.lockdown import create_using_usbmux
+    from pymobiledevice3.services.mobilebackup2 import Mobilebackup2Service
+
+    backup_directory.mkdir(parents=True, exist_ok=True)
+
+    def _prog(pct: float) -> None:
+        if on_progress:
+            # pct is typically 0-100
+            fraction = max(0.0, min(float(pct), 100.0))
+            on_progress(
+                f"iPhone backup {fraction:.0f}%",
+                int(fraction),
+                100,
+                "backup",
+            )
+
+    async with await create_using_usbmux(serial=serial) as lockdown:
+        async with Mobilebackup2Service(lockdown) as backup_client:
+            preserve_rules = Mobilebackup2Service.resolve_backup_selection(selections)
+            filter_callback = Mobilebackup2Service.combine_filter_callbacks(
+                Mobilebackup2Service.selection_filter_callback(preserve_rules)
+                if preserve_rules
+                else None,
+                Mobilebackup2Service.regex_filter_callback(regexes) if regexes else None,
+            )
+            if on_progress:
+                on_progress(
+                    f"Starting selective backup ({', '.join(selections + regexes) or 'custom'})",
+                    0,
+                    100,
+                    "backup",
+                )
+            await backup_client.backup(
+                full=True,
+                backup_directory=str(backup_directory),
+                progress_callback=_prog,
+                filter_callback=filter_callback,
+                password=password or "",
+            )
+
+
+async def _copy_content_categories_async(
+    serial: str,
+    category_ids: list[str],
+    destination: Path,
+    *,
+    backup_password: str = "",
+    on_progress: Callable[[str, int, int, str], None] | None = None,
+) -> AfcCopyResult:
+    from content_categories import CATEGORY_BY_ID
+
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    log_path = default_log_path(destination)
+
+    succeeded: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    filter_stats = {"filtered_out": 0}
+    device_name = serial
+    selected_labels: list[str] = []
+
+    afc_jobs: list[tuple[str, str, set[str] | None, str]] = []
+    # (logical_path, dest_subdir_name, extensions, kind_label)
+    backup_selections: list[str] = []
+    backup_regexes: list[str] = []
+
+    for cat_id in category_ids:
+        cat = CATEGORY_BY_ID.get(cat_id)
+        if cat is None:
+            failed.append(
+                {
+                    "timestamp": _now(),
+                    "device": device_name,
+                    "source_folder": cat_id,
+                    "file_name": "",
+                    "relative_path": "",
+                    "source_path": cat_id,
+                    "destination_path": str(destination),
+                    "error": f"Unknown category: {cat_id}",
+                    "status": "Skipped",
+                }
+            )
+            continue
+        selected_labels.append(cat.label)
+        sub = _safe_dir_name(cat.label)
+        if cat.kind == "afc_media":
+            logical = f"{MEDIA_PREFIX}/{cat.media_remote}" if cat.media_remote else MEDIA_PREFIX
+            afc_jobs.append((logical, sub, set(cat.extensions) if cat.extensions else None, cat.label))
+        elif cat.kind == "afc_app":
+            logical = f"{APPS_PREFIX}/{cat.bundle_id}"
+            afc_jobs.append((logical, sub, set(cat.extensions) if cat.extensions else None, cat.label))
+        elif cat.kind == "backup":
+            backup_selections.extend(cat.backup_selections)
+            backup_regexes.extend(cat.backup_regexes)
+
+    # Deduplicate backup selections
+    backup_selections = list(dict.fromkeys(backup_selections))
+    backup_regexes = list(dict.fromkeys(backup_regexes))
+
+    # Run each AFC category into its own subfolder with extension filter
+    for logical, sub, exts, label in afc_jobs:
+        if on_progress:
+            on_progress(f"Category: {label}", 0, max(len(afc_jobs), 1), "starting")
+        cat_dest = destination / sub
+        cat_dest.mkdir(parents=True, exist_ok=True)
+        try:
+            partial = await _copy_folders_async(
+                serial,
+                [logical],
+                cat_dest,
+                on_progress=on_progress,
+                allowed_extensions=exts,
+                filter_stats=filter_stats,
+            )
+            # Re-base relative paths in log rows for clarity
+            for row in partial.succeeded:
+                row["source_folder"] = label
+                succeeded.append(row)
+            for row in partial.failed:
+                row["source_folder"] = label
+                failed.append(row)
+            if partial.succeeded or not partial.failed:
+                device_name = (
+                    partial.succeeded[0].get("device", device_name)
+                    if partial.succeeded
+                    else device_name
+                )
+        except Exception as exc:  # noqa: BLE001
+            failed.append(
+                {
+                    "timestamp": _now(),
+                    "device": device_name,
+                    "source_folder": label,
+                    "file_name": "",
+                    "relative_path": "",
+                    "source_path": logical,
+                    "destination_path": str(cat_dest),
+                    "error": _format_exc(exc),
+                    "status": "Skipped",
+                }
+            )
+
+    if backup_selections or backup_regexes:
+        backup_root = destination / "iPhone_Backup_Selected"
+        try:
+            await _backup_selections_async(
+                serial,
+                backup_root,
+                selections=backup_selections,
+                regexes=backup_regexes,
+                password=backup_password,
+                on_progress=on_progress,
+            )
+            succeeded.append(
+                {
+                    "timestamp": _now(),
+                    "device": device_name,
+                    "source_folder": "Selective iPhone backup",
+                    "file_name": backup_root.name,
+                    "relative_path": backup_root.name,
+                    "destination_path": str(backup_root),
+                    "status": "Copied",
+                }
+            )
+            if on_progress:
+                on_progress(
+                    f"Backup saved under {backup_root}",
+                    100,
+                    100,
+                    "done",
+                )
+        except Exception as exc:  # noqa: BLE001
+            err = _format_exc(exc)
+            hint = ""
+            if "password" in err.lower() or "encrypt" in err.lower():
+                hint = (
+                    " — If the iPhone has encrypted backups enabled, enter the "
+                    "backup password in the UI (or disable encrypted backup on the phone)."
+                )
+            failed.append(
+                {
+                    "timestamp": _now(),
+                    "device": device_name,
+                    "source_folder": "Selective iPhone backup",
+                    "file_name": "",
+                    "relative_path": "",
+                    "source_path": ",".join(backup_selections + backup_regexes),
+                    "destination_path": str(backup_root),
+                    "error": err + hint,
+                    "status": "Skipped",
+                }
+            )
+
+    try:
+        write_copy_excel_log(
+            log_path,
+            device_name=device_name,
+            selected_folders=selected_labels,
+            succeeded=succeeded,
+            failed=failed,
+        )
+    except Exception:
+        log_path = None
+
+    return AfcCopyResult(
+        succeeded=succeeded,
+        failed=failed,
+        log_path=log_path,
+        selected_folders=selected_labels,
+        filtered_out=int(filter_stats.get("filtered_out", 0)),
+    )
+
+
+def copy_content_categories(
+    serial: str,
+    category_ids: list[str],
+    destination: Path,
+    *,
+    backup_password: str = "",
+    on_progress: Callable[[str, int, int, str], None] | None = None,
+) -> AfcCopyResult:
+    """Copy curated content categories (filtered media + optional selective backup)."""
+    if not category_ids:
+        return AfcCopyResult(selected_folders=[])
+    if not afc_available():
+        raise AfcError(
+            "pymobiledevice3 is not installed. Run: python -m pip install pymobiledevice3"
+        )
+    try:
+        return _run(
+            _copy_content_categories_async(
+                serial,
+                category_ids,
+                destination,
+                backup_password=backup_password,
+                on_progress=on_progress,
+            )
+        )
+    except AfcError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise AfcError(f"Content copy failed: {_format_exc(exc)}") from exc

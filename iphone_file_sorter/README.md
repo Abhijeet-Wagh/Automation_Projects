@@ -24,10 +24,16 @@ Sort files copied from an iPhone's **Internal Storage** (or any folder tree) int
 The UI has **two panels (tabs)**:
 
 ### 1. Copy files
-Uses **Apple AFC** (via `pymobiledevice3`) to copy real files from the iPhone **Media**
-area (`DCIM`, `Downloads`, `Recordings`, …) and, when iOS allows, selected **Apps**
-(WhatsApp / Telegram). Windows MTP/Explorer-style copy is avoided because it often
-creates **empty folders**.
+Uses **Apple AFC** (via `pymobiledevice3`) with **content categories** so you copy what
+matters and skip junk:
+
+- Camera photos & videos (`DCIM`)
+- Voice memos / recordings
+- Downloads (PDFs, docs)
+- WhatsApp / Telegram **media** (when iOS allows USB app access)
+- Optional selective backup: SMS, Contacts, WhatsApp chat DB, call history, Notes
+
+Windows MTP/Explorer-style copy is avoided because it often creates **empty folders**.
 
 1. On Windows, prefer **Python 3.12** (3.13 often fails installing `lzfse`).
    Easiest: double-click `Start_UI_Py312.bat`  
@@ -42,14 +48,14 @@ creates **empty folders**.
    ```
 
 2. Unlock iPhone → tap **Trust**
-3. **Refresh devices** → select iPhone → **Load folder tree**
-4. Expand **Media** (and **Apps** if listed) → check folders → **Browse** destination → **Copy**
+3. **Refresh devices** → select iPhone
+4. Check content categories (recommended defaults are fine) → destination `C:\iPhone_Copy` → **Copy**
 
 Behavior:
-- Copies real files over USB, **file-by-file** (progress + per-file timeout)
-- Stuck/failed files are skipped; re-run resumes already-copied files
-- An Excel log is saved in the destination folder
-- Explorer “WhatsApp” folders are MTP-only; AFC may not see app sandboxes unless iOS grants access
+- Filters to images / videos / audio / documents; ignores PhotoData caches
+- File-by-file copy with timeouts; re-run resumes already-copied files
+- Excel log for real failures
+- Chat **text** / Contacts / SMS arrive as backup databases (not pretty HTML exports)
 
 ### 2. Sort files
 1. Open the **Sort files** tab

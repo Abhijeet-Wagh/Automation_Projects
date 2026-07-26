@@ -14,6 +14,11 @@ from pathlib import Path
 
 import streamlit as st
 
+from content_categories import (
+    CATEGORIES,
+    categories_by_group,
+    default_selected_ids,
+)
 from folder_picker import pick_folder
 from folder_tree import all_paths, apply_check, count_folders, selection_roots
 from sort_files import CATEGORY_EXTENSIONS, categorize, iter_source_files, sort_files
@@ -24,6 +29,7 @@ try:
         AfcError,
         afc_available,
         copy_afc_folders,
+        copy_content_categories,
         list_afc_devices,
         list_afc_folder_tree,
         summarize_copy_rows,
@@ -42,6 +48,9 @@ except Exception as exc:  # pragma: no cover
         return {"name": "iPhone", "path": "", "children": []}
 
     def copy_afc_folders(*_args, **_kwargs):
+        raise RuntimeError("AFC copy unavailable.")
+
+    def copy_content_categories(*_args, **_kwargs):
         raise RuntimeError("AFC copy unavailable.")
 
     def summarize_copy_rows(succeeded, failed):
@@ -169,10 +178,17 @@ def _init_state() -> None:
         "tree_expand_initialized": False,
         "completed_folders": [],
         "batch_size": 5,
+        "content_selected": default_selected_ids(),
+        "backup_password": "",
+        "copy_mode": "categories",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    for cat in CATEGORIES:
+        ck = f"cat::{cat.id}"
+        if ck not in st.session_state:
+            st.session_state[ck] = bool(cat.default_on)
 
 
 def _inject_tree_scroll_styles() -> None:
@@ -519,19 +535,18 @@ def render_folder_tree_picker(
 
 def render_copy_from_iphone() -> None:
     st.write(
-        "Copy **real photo/video files** from iPhone to this laptop using Apple AFC "
-        "(not Windows MTP — MTP often creates empty folders)."
+        "Copy the content you care about from iPhone → laptop: "
+        "camera media, WhatsApp media, documents, recordings, and optionally "
+        "SMS/Contacts/Notes/chat databases via selective backup."
     )
 
     if not is_windows():
         st.warning("This copy panel is intended for Windows with iTunes/Apple Devices installed.")
 
     st.info(
-        "Windows Explorer MTP copy is unreliable (empty folders). "
-        "This app uses **Apple AFC** via pymobiledevice3 to pull real files from the "
-        "iPhone **Media** area (DCIM, Downloads, Recordings, …). "
-        "WhatsApp/Telegram appear under **Apps** only if iOS allows USB access "
-        "(many apps block this — Explorer’s WhatsApp folder is a different MTP view)."
+        "Recommended mode uses **content categories** with file-type filters "
+        "(images, videos, audio, PDFs/docs). PhotoData system junk is excluded. "
+        "Chat **text**, Contacts, SMS, and Notes use a selective backup (database files)."
     )
 
     top = st.columns([1, 1])
@@ -620,50 +635,127 @@ def render_copy_from_iphone() -> None:
     serial = serials[labels.index(choice)]
     st.session_state["afc_serial"] = serial
 
-    load = st.button("Load folder tree from iPhone", use_container_width=True)
-    if load:
-        try:
-            with st.spinner("Reading Media + Apps folders via Apple AFC..."):
-                tree = list_afc_folder_tree(serial, max_depth=3)
-                st.session_state["iphone_tree"] = tree
-                st.session_state["tree_selected"] = []
-                # Expand root + Media so DCIM and siblings are visible
-                expanded = [tree.get("path", "")]
-                for child in tree.get("children") or []:
-                    if child.get("path") == "media":
-                        expanded.append(child["path"])
-                st.session_state["tree_expanded"] = expanded
-                st.session_state["tree_expand_initialized"] = True
-                _sync_tree_checkbox_keys(tree, set())
-        except AfcError as exc:
-            st.error(str(exc))
-            st.session_state["iphone_tree"] = None
-            st.session_state["tree_expand_initialized"] = False
+    st.markdown("#### What do you want to copy?")
+    st.caption(
+        "Choose content types below. The app **filters to useful files** "
+        "(images, videos, audio, PDFs/docs) and skips PhotoData caches / system junk. "
+        "SMS, Contacts, Notes, and WhatsApp **chat text** need a selective iPhone backup."
+    )
 
-    tree = st.session_state.get("iphone_tree")
-    if tree:
-        st.success(
-            f"Loaded **{tree.get('name', 'iPhone')}** "
-            f"({count_folders(tree)} folders) via AFC."
+    mode = st.radio(
+        "Copy mode",
+        options=["categories", "advanced_tree"],
+        format_func=lambda m: (
+            "Recommended: content categories (filtered)"
+            if m == "categories"
+            else "Advanced: raw folder tree"
+        ),
+        horizontal=True,
+        key="copy_mode",
+    )
+
+    selected_folders: list[str] = []
+    selected_categories: list[str] = []
+    backup_password = ""
+
+    if mode == "categories":
+        groups = categories_by_group()
+        group_titles = {
+            "media": "Photos, videos, audio, documents, WhatsApp media",
+            "messages": "Chats / SMS (selective backup — databases, not pretty HTML)",
+            "people": "Contacts, call history, Notes (selective backup)",
+        }
+        chosen: list[str] = []
+        for group_key, cats in groups.items():
+            if not cats:
+                continue
+            st.markdown(f"**{group_titles.get(group_key, group_key)}**")
+            for cat in cats:
+                checked = st.checkbox(
+                    cat.label,
+                    key=f"cat::{cat.id}",
+                    help=cat.description,
+                )
+                if checked:
+                    chosen.append(cat.id)
+        st.session_state["content_selected"] = chosen
+        selected_categories = chosen
+
+        needs_backup = any(
+            c.kind == "backup"
+            for c in CATEGORIES
+            if c.id in selected_categories
         )
-        st.caption(
-            "**What to select:** start with **Media → DCIM → one album** "
-            "(e.g. `127APPLE`) — those are your real photos/videos. "
-            "Avoid **PhotoData** / caches for the first test (system files, often timeout). "
-            "WhatsApp appears under **Apps** only if iOS allows USB access."
-        )
-        selected_folders = render_folder_tree_picker(
-            tree, allow_lazy_subfolders=False
-        )
+        if needs_backup:
+            backup_password = st.text_input(
+                "iPhone backup password (only if encrypted backups are enabled)",
+                type="password",
+                key="backup_password",
+                help=(
+                    "Required when the iPhone encrypts local backups. "
+                    "Set/check this in Finder or iTunes backup settings."
+                ),
+            )
+            st.caption(
+                "Backup items are saved under `iPhone_Backup_Selected` in your destination. "
+                "They are database files — use a viewer/exporter later for readable chats."
+            )
+
+        c1, c2 = st.columns(2)
+        if c1.button("Select recommended", use_container_width=True):
+            recommended = set(default_selected_ids())
+            for cat in CATEGORIES:
+                st.session_state[f"cat::{cat.id}"] = cat.id in recommended
+            st.session_state["content_selected"] = default_selected_ids()
+            st.rerun()
+        if c2.button("Clear categories", use_container_width=True):
+            for cat in CATEGORIES:
+                st.session_state[f"cat::{cat.id}"] = False
+            st.session_state["content_selected"] = []
+            st.rerun()
+
+        if selected_categories:
+            st.info(
+                f"**{len(selected_categories)}** content type(s) selected. "
+                "Junk/system files are excluded automatically while copying."
+            )
     else:
-        selected_folders = []
-        st.info("Click **Load folder tree from iPhone** to browse Media and Apps folders.")
+        load = st.button("Load folder tree from iPhone", use_container_width=True)
+        if load:
+            try:
+                with st.spinner("Reading Media + Apps folders via Apple AFC..."):
+                    tree = list_afc_folder_tree(serial, max_depth=3)
+                    st.session_state["iphone_tree"] = tree
+                    st.session_state["tree_selected"] = []
+                    expanded = [tree.get("path", "")]
+                    for child in tree.get("children") or []:
+                        if child.get("path") == "media":
+                            expanded.append(child["path"])
+                    st.session_state["tree_expanded"] = expanded
+                    st.session_state["tree_expand_initialized"] = True
+                    _sync_tree_checkbox_keys(tree, set())
+            except AfcError as exc:
+                st.error(str(exc))
+                st.session_state["iphone_tree"] = None
+                st.session_state["tree_expand_initialized"] = False
+
+        tree = st.session_state.get("iphone_tree")
+        if tree:
+            st.warning(
+                "Advanced mode copies whole folders. Prefer **Media → DCIM** only; "
+                "avoid PhotoData."
+            )
+            selected_folders = render_folder_tree_picker(
+                tree, allow_lazy_subfolders=False
+            )
+        else:
+            st.info("Click **Load folder tree from iPhone** for advanced browsing.")
 
     destination = path_with_browse(
         label="Paste to folder on laptop",
         state_key="copy_destination",
-        placeholder=r"C:\Users\YourName\Documents\iPhone_Copy",
-        help_text="Files/folders from the iPhone will be copied here.",
+        placeholder=r"C:\iPhone_Copy",
+        help_text="Prefer a local folder (not OneDrive).",
     )
 
     also_sort = st.checkbox(
@@ -675,20 +767,18 @@ def render_copy_from_iphone() -> None:
         sort_destination = path_with_browse(
             label="Sorted output folder",
             state_key="copy_sort_destination",
-            placeholder=r"C:\Users\YourName\Documents\iPhone_Sorted",
+            placeholder=r"C:\iPhone_Sorted",
             help_text="Category folders will be created here after copying.",
         )
 
     st.caption(
-        "Copy runs **file-by-file**: progress shows file N of total. "
-        "If a file hangs, it times out, is skipped, and the rest continue. "
-        "Re-run the same selection to resume (already-copied files are skipped). "
-        "Failures are listed in an Excel log."
+        "Copy runs file-by-file with timeouts. Re-run to resume "
+        "(already-copied files are skipped). Excel log lists real failures."
     )
 
-    has_selection = bool(selected_folders)
+    has_selection = bool(selected_categories) if mode == "categories" else bool(selected_folders)
     do_copy = st.button(
-        "Copy selected folders to laptop",
+        "Copy selected content to laptop",
         type="primary",
         use_container_width=True,
         disabled=not (has_selection and destination),
@@ -704,11 +794,11 @@ def render_copy_from_iphone() -> None:
             "or very slow. Prefer a local folder such as "
             r"`C:\Users\abhij\Documents\iPhone_Copy` (outside OneDrive) or `C:\iPhone_Copy`."
         )
-    progress = st.progress(0, text="Starting AFC copy...")
+    progress = st.progress(0, text="Starting copy...")
     status = st.empty()
     st.info(
-        "Keep the iPhone unlocked. Copy starts immediately (no full file count). "
-        "Watch this status line and the destination folder for new files."
+        "Keep the iPhone unlocked. Filtered copy starts immediately — "
+        "watch this status line and the destination folder."
     )
     st.write(f"Destination: `{dest_path}`")
 
@@ -722,22 +812,30 @@ def render_copy_from_iphone() -> None:
 
     try:
         with st.spinner(
-            "Copying via Apple AFC… first files should appear in the destination shortly. "
-            "Stuck files are skipped after a timeout."
+            "Copying from iPhone… useful files only; junk is skipped quietly."
         ):
-            result = copy_afc_folders(
-                serial,
-                selected_folders,
-                dest_path,
-                on_progress=on_progress,
-            )
+            if mode == "categories":
+                result = copy_content_categories(
+                    serial,
+                    selected_categories,
+                    dest_path,
+                    backup_password=backup_password or "",
+                    on_progress=on_progress,
+                )
+            else:
+                result = copy_afc_folders(
+                    serial,
+                    selected_folders,
+                    dest_path,
+                    on_progress=on_progress,
+                )
     except AfcError as exc:
         detail = str(exc).strip() or repr(exc)
         st.error(detail)
         st.caption(
-            "Tip: copy **Media → DCIM → one album** (e.g. 127APPLE) first. "
-            "Folders like PhotoData contain system caches that often time out. "
-            "Also avoid OneDrive destinations."
+            "If WhatsApp media fails, iOS may block app USB access — "
+            "use WhatsApp Export, or enable the WhatsApp chat database backup option. "
+            "Avoid OneDrive destinations."
         )
         return
     except Exception as exc:  # noqa: BLE001
@@ -745,38 +843,28 @@ def render_copy_from_iphone() -> None:
         st.error(f"Copy failed: {detail}")
         return
 
-    completed = set(st.session_state.get("completed_folders", []))
-    completed.update(selected_folders)
-    st.session_state["completed_folders"] = sorted(completed)
+    if mode == "advanced_tree":
+        completed = set(st.session_state.get("completed_folders", []))
+        completed.update(selected_folders)
+        st.session_state["completed_folders"] = sorted(completed)
 
     progress.progress(1.0, text="Batch finished")
-    ok_n = len(result.succeeded)
     fail_n = len(result.failed)
     breakdown = summarize_copy_rows(result.succeeded, result.failed)
+    filtered_n = int(getattr(result, "filtered_out", 0) or 0)
     st.success(
         f"Batch complete: **{breakdown['copied']}** copied, "
         f"**{breakdown['already_on_disk']}** already on disk, "
-        f"**{fail_n}** skipped/failed."
+        f"**{fail_n}** failed/logged skips, "
+        f"**{filtered_n}** junk/non-matching files ignored."
     )
     st.write(f"Files saved under: `{dest_path.resolve()}`")
 
-    photodata_selected = any(
-        "photodata" in p.lower() for p in (result.selected_folders or selected_folders)
-    )
-    if photodata_selected or breakdown["system_skipped"] > 0:
+    if filtered_n or breakdown["system_skipped"] or fail_n:
         st.info(
-            "**Why so many skipped?** "
-            "Most skips are from **PhotoData** — iOS Photos app databases, caches, "
-            "thumbnails, and `.plist`/`.sqlite` files (not your camera originals). "
-            "Your real photos/videos are under **Media → DCIM** (`100APPLE`, `127APPLE`, …). "
-            f"This run: **{breakdown['system_skipped']}** system/metadata skips, "
-            f"**{breakdown['timeout']}** timeouts, "
-            f"**{breakdown['other_failed']}** other errors."
-        )
-    elif fail_n:
-        st.info(
-            f"Skip breakdown: **{breakdown['system_skipped']}** system/metadata, "
-            f"**{breakdown['timeout']}** timeouts, "
+            "Ignored/filtered files are mostly system junk or wrong type "
+            "(not images/videos/docs/audio). "
+            f"Logged failures: **{breakdown['timeout']}** timeouts, "
             f"**{breakdown['other_failed']}** other errors."
         )
 
