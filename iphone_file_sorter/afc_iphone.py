@@ -41,9 +41,42 @@ KNOWN_APP_BUNDLES: list[tuple[str, str]] = [
 ]
 
 # Per-file timeout floor / scale (seconds). Large videos need more time.
-FILE_TIMEOUT_FLOOR_SEC = 90.0
+FILE_TIMEOUT_FLOOR_SEC = 45.0
 FILE_TIMEOUT_PER_MB_SEC = 6.0  # allow ~slow USB
 FILE_TIMEOUT_CAP_SEC = 1800.0  # 30 min max per file
+FILE_TIMEOUT_SMALL_SEC = 30.0  # files under 1 MB
+
+
+def _format_exc(exc: BaseException) -> str:
+    """Readable exception text even when str(exc) is empty."""
+    text = str(exc).strip()
+    name = type(exc).__name__
+    if text:
+        return f"{name}: {text}"
+    return f"{name} (no message)"
+
+
+def _should_skip_remote(remote_file: str) -> bool:
+    """Skip iOS system caches / DB sidecars that often hang AFC and aren't user photos."""
+    path = remote_file.replace("\\", "/").lower()
+    markers = (
+        "/caches/",
+        "/cache/",
+        "photodata/caches",
+        "photodata/private",
+        "photodata/changes/",
+        "/tmp/",
+        ".sqlite-wal",
+        ".sqlite-shm",
+        ".db-wal",
+        ".db-shm",
+    )
+    if any(m in path for m in markers):
+        return True
+    # Photo library SQLite indexes — not camera originals
+    if path.endswith(".sqlite") and "photodata/" in path:
+        return True
+    return False
 
 
 @dataclass
@@ -79,7 +112,10 @@ def afc_available() -> bool:
 
 
 def _file_timeout_sec(size_bytes: int) -> float:
-    mb = max(size_bytes, 0) / (1024 * 1024)
+    size = max(size_bytes, 0)
+    if size < 1024 * 1024:
+        return FILE_TIMEOUT_SMALL_SEC
+    mb = size / (1024 * 1024)
     return min(
         FILE_TIMEOUT_CAP_SEC,
         max(FILE_TIMEOUT_FLOOR_SEC, mb * FILE_TIMEOUT_PER_MB_SEC),
@@ -448,6 +484,30 @@ async def _copy_one_remote_file(
     prog_total = max(folder_total, 1)
     prog_index = min(folder_index, prog_total)
 
+    if _should_skip_remote(remote_file):
+        handled_remotes.add(remote_file)
+        failed.append(
+            {
+                "timestamp": _now(),
+                "device": device_name,
+                "source_folder": logical_folder,
+                "file_name": Path(remote_file).name,
+                "relative_path": remote_file,
+                "source_path": remote_file,
+                "destination_path": str(local_file),
+                "error": "Skipped system cache/DB file",
+                "status": "Skipped",
+            }
+        )
+        if on_progress:
+            on_progress(
+                f"[folder {folder_index}/{folder_total}] {label} (system file skipped) · files {file_index}",
+                prog_index,
+                prog_total,
+                "skipped",
+            )
+        return "skipped"
+
     try:
         remote_size = await _stat_size(afc, remote_file)
     except Exception:
@@ -604,7 +664,20 @@ async def _copy_media_folder(
 
     del file_total  # progress is folder-based now
     file_index = file_index_start
-    async with AfcService(lockdown=lockdown) as afc:
+    afc = AfcService(lockdown=lockdown)
+    try:
+        await afc.__aenter__()
+    except Exception as exc:  # noqa: BLE001
+        if on_progress:
+            on_progress(
+                f"Could not open AFC: {_format_exc(exc)}",
+                0,
+                1,
+                "error",
+            )
+        return file_index, True
+
+    try:
         # Expand broad folders (Media root / DCIM) into child dirs so the first
         # file lands quickly and progress advances per album/folder.
         if not remote:
@@ -636,29 +709,46 @@ async def _copy_media_folder(
                     "listing",
                 )
 
-            async for remote_file in _iter_files(afc, folder_remote):
-                if remote_file in handled_remotes:
-                    continue
-                file_index += 1
-                result = await _copy_one_remote_file(
-                    afc,
-                    remote_file=remote_file,
-                    folder_remote=folder_remote,
-                    destination=destination,
-                    device_name=device_name,
-                    logical_folder=logical_folder,
-                    file_index=file_index,
-                    folder_index=folder_i,
-                    folder_total=folder_total,
-                    on_progress=on_progress,
-                    succeeded=succeeded,
-                    failed=failed,
-                    handled_remotes=handled_remotes,
-                )
-                if result in {"timeout", "disconnect"}:
-                    return file_index, True
+            try:
+                async for remote_file in _iter_files(afc, folder_remote):
+                    if remote_file in handled_remotes:
+                        continue
+                    file_index += 1
+                    result = await _copy_one_remote_file(
+                        afc,
+                        remote_file=remote_file,
+                        folder_remote=folder_remote,
+                        destination=destination,
+                        device_name=device_name,
+                        logical_folder=logical_folder,
+                        file_index=file_index,
+                        folder_index=folder_i,
+                        folder_total=folder_total,
+                        on_progress=on_progress,
+                        succeeded=succeeded,
+                        failed=failed,
+                        handled_remotes=handled_remotes,
+                    )
+                    if result in {"timeout", "disconnect"}:
+                        return file_index, True
+            except Exception as exc:  # noqa: BLE001
+                if on_progress:
+                    on_progress(
+                        f"Folder error {folder_remote}: {_format_exc(exc)}",
+                        folder_i,
+                        folder_total,
+                        "error",
+                    )
+                return file_index, True
 
-    return file_index, False
+        return file_index, False
+    finally:
+        # After a timed-out pull, AFC cleanup often throws an empty error —
+        # never let that abort the whole batch.
+        try:
+            await afc.__aexit__(None, None, None)
+        except Exception:
+            pass
 
 
 async def _copy_app_folder(
@@ -858,58 +948,100 @@ async def _copy_folders_async(
         )
 
     file_index = 0
-    for target_i, logical in enumerate(targets, start=1):
-        parsed = parse_logical_path(logical)
-        handled_remotes: set[str] = set()
-        if on_progress:
-            on_progress(
-                f"Target {target_i}/{len(targets)}: {logical}",
-                target_i - 1,
-                max(len(targets), 1),
-                "starting",
-            )
-        # Multiple passes: after a timeout/disconnect, reconnect and continue
-        # remaining files (already-handled remotes are skipped).
-        for _pass in range(8):
-            async with await create_using_usbmux(serial=serial) as lockdown:
-                device_name = str(getattr(lockdown, "display_name", None) or serial)
-
-                if parsed["kind"] == "media":
-                    file_index, needs_reconnect = await _copy_media_folder(
-                        lockdown,
-                        parsed["remote"],
-                        destination,
-                        device_name=device_name,
-                        logical_folder=logical,
-                        on_progress=on_progress,
-                        succeeded=succeeded,
-                        failed=failed,
-                        file_index_start=file_index,
-                        file_total=0,
-                        handled_remotes=handled_remotes,
+    try:
+        for target_i, logical in enumerate(targets, start=1):
+            parsed = parse_logical_path(logical)
+            handled_remotes: set[str] = set()
+            if on_progress:
+                on_progress(
+                    f"Target {target_i}/{len(targets)}: {logical}",
+                    target_i - 1,
+                    max(len(targets), 1),
+                    "starting",
+                )
+            # Multiple passes: after a timeout/disconnect, reconnect and continue
+            # remaining files (already-handled remotes are skipped).
+            completed_target = False
+            for _pass in range(8):
+                lockdown = None
+                try:
+                    lockdown = await create_using_usbmux(serial=serial)
+                    await lockdown.__aenter__()
+                    device_name = str(
+                        getattr(lockdown, "display_name", None) or serial
                     )
-                    if needs_reconnect:
-                        continue
-                    break
 
-                if parsed["kind"] == "app" and parsed["bundle_id"]:
-                    file_index, needs_reconnect = await _copy_app_folder(
-                        lockdown,
-                        parsed["bundle_id"],
-                        parsed["remote"],
-                        destination,
-                        device_name=device_name,
-                        logical_folder=logical,
-                        on_progress=on_progress,
-                        succeeded=succeeded,
-                        failed=failed,
-                        file_index_start=file_index,
-                        file_total=max(file_index + 1, 1),
+                    if parsed["kind"] == "media":
+                        file_index, needs_reconnect = await _copy_media_folder(
+                            lockdown,
+                            parsed["remote"],
+                            destination,
+                            device_name=device_name,
+                            logical_folder=logical,
+                            on_progress=on_progress,
+                            succeeded=succeeded,
+                            failed=failed,
+                            file_index_start=file_index,
+                            file_total=0,
+                            handled_remotes=handled_remotes,
+                        )
+                        if needs_reconnect:
+                            continue
+                        completed_target = True
+                        break
+
+                    if parsed["kind"] == "app" and parsed["bundle_id"]:
+                        file_index, needs_reconnect = await _copy_app_folder(
+                            lockdown,
+                            parsed["bundle_id"],
+                            parsed["remote"],
+                            destination,
+                            device_name=device_name,
+                            logical_folder=logical,
+                            on_progress=on_progress,
+                            succeeded=succeeded,
+                            failed=failed,
+                            file_index_start=file_index,
+                            file_total=max(file_index + 1, 1),
+                        )
+                        if needs_reconnect:
+                            continue
+                        completed_target = True
+                        break
+
+                    failed.append(
+                        {
+                            "timestamp": _now(),
+                            "device": device_name,
+                            "source_folder": logical,
+                            "file_name": "",
+                            "relative_path": "",
+                            "source_path": logical,
+                            "destination_path": str(destination),
+                            "error": "Nothing to copy for this tree node",
+                            "status": "Skipped",
+                        }
                     )
-                    if needs_reconnect:
-                        continue
+                    completed_target = True
                     break
+                except Exception as exc:  # noqa: BLE001
+                    if on_progress:
+                        on_progress(
+                            f"Reconnect/session issue: {_format_exc(exc)}",
+                            target_i,
+                            max(len(targets), 1),
+                            "error",
+                        )
+                    await asyncio.sleep(1.0)
+                    continue
+                finally:
+                    if lockdown is not None:
+                        try:
+                            await lockdown.__aexit__(None, None, None)
+                        except Exception:
+                            pass
 
+            if not completed_target:
                 failed.append(
                     {
                         "timestamp": _now(),
@@ -919,19 +1051,23 @@ async def _copy_folders_async(
                         "relative_path": "",
                         "source_path": logical,
                         "destination_path": str(destination),
-                        "error": "Nothing to copy for this tree node",
+                        "error": "Gave up after repeated USB/AFC session errors",
                         "status": "Skipped",
                     }
                 )
-                break
+    finally:
+        # Always write a log, even if a later target fails.
+        try:
+            write_copy_excel_log(
+                log_path,
+                device_name=device_name,
+                selected_folders=folder_paths,
+                succeeded=succeeded,
+                failed=failed,
+            )
+        except Exception:
+            log_path = None
 
-    write_copy_excel_log(
-        log_path,
-        device_name=device_name,
-        selected_folders=folder_paths,
-        succeeded=succeeded,
-        failed=failed,
-    )
     return AfcCopyResult(
         succeeded=succeeded,
         failed=failed,
@@ -965,4 +1101,4 @@ def copy_afc_folders(
     except AfcError:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise AfcError(f"AFC copy failed: {exc}") from exc
+        raise AfcError(f"AFC copy failed: {_format_exc(exc)}") from exc

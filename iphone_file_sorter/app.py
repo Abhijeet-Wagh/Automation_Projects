@@ -637,11 +637,10 @@ def render_copy_from_iphone() -> None:
             f"({count_folders(tree)} folders) via AFC."
         )
         st.caption(
-            "**Why not every Explorer folder?** AFC only sees `/var/mobile/Media` "
-            "(Camera Roll / DCIM, Downloads, Voice Memos, …). "
-            "WhatsApp chat media lives in the app sandbox — it shows under **Apps** "
-            "only when iOS grants house_arrest access. If Apps is empty, use WhatsApp "
-            "**Export chat** / **Save to Photos**, or an encrypted iPhone backup tool."
+            "**What to select:** start with **Media → DCIM → one album** "
+            "(e.g. `127APPLE`) — those are your real photos/videos. "
+            "Avoid **PhotoData** / caches for the first test (system files, often timeout). "
+            "WhatsApp appears under **Apps** only if iOS allows USB access."
         )
         selected_folders = render_folder_tree_picker(
             tree, allow_lazy_subfolders=False
@@ -723,10 +722,17 @@ def render_copy_from_iphone() -> None:
                 on_progress=on_progress,
             )
     except AfcError as exc:
-        st.error(str(exc))
+        detail = str(exc).strip() or repr(exc)
+        st.error(detail)
+        st.caption(
+            "Tip: copy **Media → DCIM → one album** (e.g. 127APPLE) first. "
+            "Folders like PhotoData contain system caches that often time out. "
+            "Also avoid OneDrive destinations."
+        )
         return
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Copy failed: {exc}")
+        detail = str(exc).strip() or repr(exc)
+        st.error(f"Copy failed: {detail}")
         return
 
     completed = set(st.session_state.get("completed_folders", []))
