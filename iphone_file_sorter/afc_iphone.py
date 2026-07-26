@@ -56,8 +56,33 @@ def _format_exc(exc: BaseException) -> str:
     return f"{name} (no message)"
 
 
+# Real user media extensions (used when filtering PhotoData noise)
+_USER_MEDIA_SUFFIXES = (
+    ".heic",
+    ".heif",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".tif",
+    ".tiff",
+    ".bmp",
+    ".webp",
+    ".mov",
+    ".mp4",
+    ".m4v",
+    ".3gp",
+    ".avi",
+    ".mkv",
+    ".aae",
+    ".dng",
+    ".cr2",
+    ".nef",
+)
+
+
 def _should_skip_remote(remote_file: str) -> bool:
-    """Skip iOS system caches / DB sidecars that often hang AFC and aren't user photos."""
+    """Skip iOS system caches / DB / metadata that aren't user photos/videos."""
     path = remote_file.replace("\\", "/").lower()
     markers = (
         "/caches/",
@@ -73,10 +98,43 @@ def _should_skip_remote(remote_file: str) -> bool:
     )
     if any(m in path for m in markers):
         return True
-    # Photo library SQLite indexes — not camera originals
     if path.endswith(".sqlite") and "photodata/" in path:
         return True
+
+    # PhotoData is mostly Photos.app databases, thumbnails, and analysis files.
+    # Only keep actual media-looking files from there; DCIM holds camera originals.
+    if "photodata/" in path:
+        if not path.endswith(_USER_MEDIA_SUFFIXES):
+            return True
     return False
+
+
+def summarize_copy_rows(
+    succeeded: list[dict], failed: list[dict]
+) -> dict[str, int]:
+    """Count copy outcomes for UI explanation."""
+    summary = {
+        "copied": 0,
+        "already_on_disk": 0,
+        "system_skipped": 0,
+        "timeout": 0,
+        "other_failed": 0,
+    }
+    for row in succeeded:
+        status = str(row.get("status", ""))
+        if "already" in status.lower():
+            summary["already_on_disk"] += 1
+        else:
+            summary["copied"] += 1
+    for row in failed:
+        err = str(row.get("error", "")).lower()
+        if "system cache" in err or "system file" in err:
+            summary["system_skipped"] += 1
+        elif "timed out" in err or "timeout" in err:
+            summary["timeout"] += 1
+        else:
+            summary["other_failed"] += 1
+    return summary
 
 
 @dataclass

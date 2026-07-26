@@ -26,6 +26,7 @@ try:
         copy_afc_folders,
         list_afc_devices,
         list_afc_folder_tree,
+        summarize_copy_rows,
     )
 except Exception as exc:  # pragma: no cover
     _AFC_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
@@ -42,6 +43,15 @@ except Exception as exc:  # pragma: no cover
 
     def copy_afc_folders(*_args, **_kwargs):
         raise RuntimeError("AFC copy unavailable.")
+
+    def summarize_copy_rows(succeeded, failed):
+        return {
+            "copied": len(succeeded or []),
+            "already_on_disk": 0,
+            "system_skipped": 0,
+            "timeout": 0,
+            "other_failed": len(failed or []),
+        }
 
 
 try:
@@ -742,10 +752,33 @@ def render_copy_from_iphone() -> None:
     progress.progress(1.0, text="Batch finished")
     ok_n = len(result.succeeded)
     fail_n = len(result.failed)
+    breakdown = summarize_copy_rows(result.succeeded, result.failed)
     st.success(
-        f"Batch complete: **{ok_n}** copied, **{fail_n}** skipped/failed."
+        f"Batch complete: **{breakdown['copied']}** copied, "
+        f"**{breakdown['already_on_disk']}** already on disk, "
+        f"**{fail_n}** skipped/failed."
     )
     st.write(f"Files saved under: `{dest_path.resolve()}`")
+
+    photodata_selected = any(
+        "photodata" in p.lower() for p in (result.selected_folders or selected_folders)
+    )
+    if photodata_selected or breakdown["system_skipped"] > 0:
+        st.info(
+            "**Why so many skipped?** "
+            "Most skips are from **PhotoData** — iOS Photos app databases, caches, "
+            "thumbnails, and `.plist`/`.sqlite` files (not your camera originals). "
+            "Your real photos/videos are under **Media → DCIM** (`100APPLE`, `127APPLE`, …). "
+            f"This run: **{breakdown['system_skipped']}** system/metadata skips, "
+            f"**{breakdown['timeout']}** timeouts, "
+            f"**{breakdown['other_failed']}** other errors."
+        )
+    elif fail_n:
+        st.info(
+            f"Skip breakdown: **{breakdown['system_skipped']}** system/metadata, "
+            f"**{breakdown['timeout']}** timeouts, "
+            f"**{breakdown['other_failed']}** other errors."
+        )
 
     if result.log_path and result.log_path.exists():
         st.write(f"Excel log: `{result.log_path.resolve()}`")
@@ -765,6 +798,10 @@ def render_copy_from_iphone() -> None:
 
     if result.failed:
         st.subheader("Failed / skipped files")
+        st.caption(
+            "Open the Excel log and filter the Error column — "
+            "`Skipped system cache/DB file` means intentional (not a photo)."
+        )
         st.dataframe(result.failed, use_container_width=True)
     else:
         st.info("No failed files in this batch.")
