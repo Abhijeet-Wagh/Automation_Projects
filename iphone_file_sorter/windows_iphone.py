@@ -9,6 +9,8 @@ Requires: pywin32 (Windows only)
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -62,7 +64,11 @@ def _com_initialized() -> Iterator[None]:
             "pywin32 is required on Windows. Run: python -m pip install pywin32"
         ) from exc
 
-    pythoncom.CoInitialize()
+    # Apartment-threaded COM is required for Shell.Application CopyHere
+    try:
+        pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+    except Exception:
+        pythoncom.CoInitialize()
     try:
         yield
     finally:
@@ -70,6 +76,16 @@ def _com_initialized() -> Iterator[None]:
             pythoncom.CoUninitialize()
         except Exception:
             pass
+
+
+def _pump_messages() -> None:
+    """Shell CopyHere needs a Win32 message pump or transfers never finish."""
+    try:
+        import pythoncom  # type: ignore
+
+        pythoncom.PumpWaitingMessages()
+    except Exception:
+        pass
 
 
 def _shell():
@@ -80,6 +96,89 @@ def _shell():
             "pywin32 is required on Windows. Run: python -m pip install pywin32"
         ) from exc
     return win32com.client.Dispatch("Shell.Application")
+
+
+def _worker_script() -> Path:
+    return Path(__file__).resolve().with_name("shell_copy_worker.py")
+
+
+def _copy_folder_via_worker(
+    device_name: str,
+    folder_rel: str,
+    destination: Path,
+    *,
+    timeout_sec: float = 7200.0,
+    on_progress: Callable[[str, int, int, str], None] | None = None,
+    index: int = 1,
+    total: int = 1,
+) -> tuple[bool, int, str]:
+    """
+    Copy one folder in a separate Python process with a real message pump.
+    Returns (ok, file_count, detail).
+    """
+    worker = _worker_script()
+    if not worker.exists():
+        raise WindowsShellError(f"Missing worker script: {worker}")
+
+    cmd = [
+        sys.executable,
+        str(worker),
+        device_name,
+        folder_rel,
+        str(destination),
+        str(timeout_sec),
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    file_count = 0
+    detail = ""
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("COPY_PROGRESS"):
+            # COPY_PROGRESS files=12 elapsed=5
+            parts = dict(
+                p.split("=", 1) for p in line.split()[1:] if "=" in p
+            )
+            file_count = int(parts.get("files", "0"))
+            elapsed = parts.get("elapsed", "?")
+            if on_progress:
+                on_progress(
+                    f"{folder_rel} ({file_count} files, {elapsed}s)",
+                    index,
+                    total,
+                    "copying folder",
+                )
+        elif line.startswith("COPY_DONE"):
+            parts = dict(
+                p.split("=", 1) for p in line.split()[1:] if "=" in p
+            )
+            if "files" in parts:
+                file_count = int(parts["files"])
+            detail = line
+        elif line.startswith("COPY_FAIL"):
+            detail = line
+        elif line.startswith("COPY_START"):
+            if on_progress:
+                on_progress(folder_rel, index, total, "starting")
+
+    rc = proc.wait()
+    dest_folder = Path(destination) / folder_rel
+    actual = _count_files(dest_folder)
+    if actual > file_count:
+        file_count = actual
+    if rc == 0 and file_count > 0:
+        return True, file_count, detail or "copied"
+    if file_count > 0:
+        return True, file_count, detail or "partial copy"
+    return False, 0, detail or f"Worker failed with exit code {rc}"
 
 
 def is_windows() -> bool:
@@ -299,6 +398,7 @@ def _wait_for_file(
     saw_exists = False
 
     while time.time() - start < timeout_sec:
+        _pump_messages()
         elapsed = time.time() - start
         if on_tick is not None:
             on_tick(elapsed, timeout_sec)
@@ -308,7 +408,7 @@ def _wait_for_file(
             try:
                 size = path.stat().st_size
             except OSError:
-                time.sleep(0.5)
+                time.sleep(0.2)
                 continue
 
             # Accept any non-empty file that stayed the same size briefly
@@ -319,7 +419,7 @@ def _wait_for_file(
             else:
                 stable_rounds = 0
                 last_size = size
-        time.sleep(0.5)
+        time.sleep(0.2)
 
     if saw_exists:
         try:
@@ -353,6 +453,7 @@ def _wait_for_folder_copy(
     stable_rounds = 0
 
     while time.time() - start < timeout_sec:
+        _pump_messages()
         count = _count_files(dest_folder)
         elapsed = time.time() - start
         if on_tick is not None:
@@ -419,14 +520,9 @@ def copy_folders_bulk(
     succeeded: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
 
+    # Resolve target folder names (may need a short COM call)
     with _com_initialized():
-        shell = _shell()
         media_root, media_label = find_internal_storage(device_name)
-        dest_ns = shell.NameSpace(str(destination.resolve()))
-        if dest_ns is None:
-            raise WindowsShellError(f"Could not open destination: {destination}")
-
-        # Expand "" into all top-level children
         targets: list[str] = []
         for folder_rel in folder_names:
             if folder_rel == "":
@@ -434,83 +530,71 @@ def copy_folders_bulk(
             else:
                 targets.append(folder_rel)
 
-        # De-dupe preserving order
-        seen: set[str] = set()
-        unique_targets: list[str] = []
-        for t in targets:
-            if t not in seen:
-                seen.add(t)
-                unique_targets.append(t)
+    seen: set[str] = set()
+    unique_targets: list[str] = []
+    for t in targets:
+        if t not in seen:
+            seen.add(t)
+            unique_targets.append(t)
 
-        total = len(unique_targets)
-        for index, folder_rel in enumerate(unique_targets, start=1):
-            if on_progress:
-                on_progress(folder_rel, index, total, "copying folder")
+    total = len(unique_targets)
+    for index, folder_rel in enumerate(unique_targets, start=1):
+        dest_folder = destination / folder_rel
+        try:
+            # Separate process with message pump — required for MTP CopyHere
+            ok, count, reason = _copy_folder_via_worker(
+                device_name,
+                folder_rel,
+                destination,
+                timeout_sec=folder_timeout_sec,
+                on_progress=on_progress,
+                index=index,
+                total=total,
+            )
+            if not ok:
+                raise WindowsShellError(reason or "Folder copy failed")
 
-            dest_folder = destination / folder_rel
-            try:
-                item = _resolve_folder_item(media_root, folder_rel)
-                dest_ns.CopyHere(item, COPY_FLAGS_VISIBLE)
-
-                def _tick(count: int, elapsed: float, _folder=folder_rel, _i=index, _t=total):
-                    if on_progress:
-                        on_progress(
-                            f"{_folder} ({count} files, {int(elapsed)}s)",
-                            _i,
-                            _t,
-                            "copying folder",
+            if dest_folder.exists():
+                for path in dest_folder.rglob("*"):
+                    if path.is_file():
+                        rel = str(path.relative_to(dest_folder)).replace("\\", "/")
+                        succeeded.append(
+                            {
+                                "timestamp": _now(),
+                                "device": device_name,
+                                "source_folder": folder_rel,
+                                "file_name": path.name,
+                                "relative_path": rel,
+                                "destination_path": str(path),
+                                "status": "Copied",
+                            }
                         )
 
-                ok, count, reason = _wait_for_folder_copy(
-                    dest_folder,
-                    timeout_sec=folder_timeout_sec,
-                    on_tick=_tick,
+            if on_progress:
+                on_progress(
+                    f"{folder_rel} ({count} files)",
+                    index,
+                    total,
+                    "done",
                 )
-                if not ok:
-                    raise WindowsShellError(reason)
 
-                # Log each arrived file as success
-                if dest_folder.exists():
-                    for path in dest_folder.rglob("*"):
-                        if path.is_file():
-                            rel = str(path.relative_to(dest_folder)).replace("\\", "/")
-                            succeeded.append(
-                                {
-                                    "timestamp": _now(),
-                                    "device": device_name,
-                                    "source_folder": folder_rel,
-                                    "file_name": path.name,
-                                    "relative_path": rel,
-                                    "destination_path": str(path),
-                                    "status": "Copied",
-                                }
-                            )
-
-                if on_progress:
-                    on_progress(
-                        f"{folder_rel} ({count} files)",
-                        index,
-                        total,
-                        "done",
-                    )
-
-            except Exception as exc:  # noqa: BLE001
-                failed.append(
-                    {
-                        "timestamp": _now(),
-                        "device": device_name,
-                        "source_folder": folder_rel,
-                        "file_name": "",
-                        "relative_path": "",
-                        "source_path": f"{device_name}/{media_label}/{folder_rel}",
-                        "destination_path": str(dest_folder),
-                        "error": str(exc),
-                        "status": "Skipped",
-                    }
-                )
-                if on_progress:
-                    on_progress(folder_rel, index, total, "skipped")
-                continue
+        except Exception as exc:  # noqa: BLE001
+            failed.append(
+                {
+                    "timestamp": _now(),
+                    "device": device_name,
+                    "source_folder": folder_rel,
+                    "file_name": "",
+                    "relative_path": "",
+                    "source_path": f"{device_name}/{media_label}/{folder_rel}",
+                    "destination_path": str(dest_folder),
+                    "error": str(exc),
+                    "status": "Skipped",
+                }
+            )
+            if on_progress:
+                on_progress(folder_rel, index, total, "skipped")
+            continue
 
     write_copy_excel_log(
         log_path,

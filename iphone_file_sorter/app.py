@@ -455,11 +455,13 @@ def render_copy_from_iphone() -> None:
     tip.info(
         "Keep the iPhone unlocked. "
         + (
-            "Watch for a Windows copy dialog — use Skip on bad files."
+            "Look behind the browser / on the taskbar for a Windows copy window. "
+            "Files should appear under your destination folder as it runs."
             if not use_file_by_file
             else f"Waiting up to {file_timeout}s per file, then auto-skip."
         )
     )
+    st.write(f"Destination: `{dest_path}`")
 
     def on_progress(name: str, index: int, total: int, stage: str) -> None:
         fraction = 0 if total == 0 else index / max(total, 1)

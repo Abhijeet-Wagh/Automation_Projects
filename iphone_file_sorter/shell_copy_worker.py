@@ -127,11 +127,10 @@ def main(argv: list[str]) -> int:
 
             if count > 0 and count == last_count:
                 stable += 1
-                if stable >= 8:  # ~0.8s * 8 with 0.1 sleep... actually 8 * 0.1 loops with pump
-                    # use time-based stable: 8 rounds * 0.25s ~= 2s
-                    if stable >= 20:
-                        print(f"COPY_DONE files={count}", flush=True)
-                        return 0
+                # 20 * 0.1s ~= 2 seconds with no new files
+                if stable >= 20:
+                    print(f"COPY_DONE files={count}", flush=True)
+                    return 0
             else:
                 stable = 0
                 last_count = count
