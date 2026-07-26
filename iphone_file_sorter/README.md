@@ -21,24 +21,23 @@ Sort files copied from an iPhone's **Internal Storage** (or any folder tree) int
 1. Connect and unlock your iPhone (tap **Trust**)
 2. Double-click `Start_UI.bat`
 3. Wait for the browser to open (usually http://localhost:8501)
-4. Choose **Copy from iPhone to laptop**
-5. Click **Refresh devices** → select your iPhone → **Load folder tree from iPhone**
-6. Use the **checkbox tree**:
-   - Checking a parent folder selects all subfolders
-   - Uncheck any folder you do not want
-   - Or use **Next batch** / **Select all** / **Clear selection**
-7. Click **Browse** next to **Paste to folder on laptop** and choose a destination
-8. Click **Copy selected folders to laptop**
+The UI has **two panels (tabs)**:
+
+### 1. Copy files
+1. Click **Refresh devices** → select your iPhone → **Load folder tree from iPhone**
+2. Use the **checkbox tree** (parent check selects subfolders)
+3. **Browse** a laptop destination folder
+4. Click **Copy selected folders to laptop**
 
 Behavior:
 - Copies **file-by-file**
-- If one file fails, it is **skipped** and the next file continues
-- An **Excel log** is written in the destination folder (`iphone_copy_log_YYYYMMDD_HHMMSS.xlsx`) with failed file details (source path, destination path, error)
-- Use **Next batch** again for the remaining folders
+- Failed files are **skipped**; an **Excel log** is saved in the destination folder
 
-Optional: check **Also sort…** to organize into Images/Videos/Documents/Excel/PDF/Other after copy.
-
-You can also use **Sort files already on laptop** with **Browse** buttons for source and destination.
+### 2. Sort files
+1. Open the **Sort files** tab
+2. **Browse** source folder (files already on the laptop)
+3. **Browse** destination folder for sorted output
+4. Preview, then start sorting into Images / Videos / Documents / Excel / PDF / Other
 
 ### Or from a terminal
 ```bat

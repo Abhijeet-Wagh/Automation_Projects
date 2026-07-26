@@ -292,10 +292,9 @@ def render_folder_tree_picker(tree: dict, device_name: str) -> list[str]:
 
 
 def render_copy_from_iphone() -> None:
-    st.subheader("Copy from iPhone → laptop")
     st.write(
-        "Select folders from the iPhone tree (parent check selects subfolders), "
-        "copy file-by-file with auto-skip, and get an Excel failure log."
+        "Copy files from a connected **iPhone** to a folder on this laptop. "
+        "Select folders in the tree, choose where to paste, then start the copy."
     )
 
     if not is_windows():
@@ -503,23 +502,22 @@ def render_copy_from_iphone() -> None:
 
 
 def render_sort_local() -> None:
-    st.subheader("Sort files already on this laptop")
     st.write(
-        "Use this after files are already copied locally. "
-        "Browse the source folder and a destination for sorted categories."
+        "Sort files already on this laptop into "
+        "**Images / Videos / Documents / Excel / PDF / Other**."
     )
 
     source_text = path_with_browse(
-        label="Source folder (copy from)",
+        label="Source folder (files to sort)",
         state_key="sort_source",
         placeholder=r"C:\Users\YourName\Documents\iPhone_Copy",
-        help_text="Folder that already contains the iPhone files on this PC.",
+        help_text="Folder on this PC that contains the files to organize.",
     )
     destination_text = path_with_browse(
-        label="Destination folder (paste / sort into)",
+        label="Destination folder (sorted output)",
         state_key="sort_destination",
         placeholder=r"C:\Users\YourName\Documents\iPhone_Sorted",
-        help_text="Sorted category folders will be created here.",
+        help_text="Category folders will be created here.",
     )
 
     col_a, col_b = st.columns(2)
@@ -609,38 +607,46 @@ def main() -> None:
 
     st.title("iPhone File Copier & Sorter")
     st.write(
-        "Copy folders from your connected iPhone to this laptop, "
-        "then optionally sort them by file type."
+        "Two panels: **Copy** files from your iPhone to the laptop, "
+        "then **Sort** them by file type."
     )
 
-    with st.expander("Tips for reliable iPhone copy", expanded=False):
+    with st.expander("Tips & supported file types", expanded=False):
         st.markdown(
             """
+**Copy tips**
 1. Unlock iPhone → tap **Trust this computer**
 2. Turn off **Low Power Mode**, set **Auto-Lock** as long as possible
 3. Keep the screen awake while copying
 4. Copy in **batches** (use **Next batch**)
 5. Failed files are **auto-skipped**; check the Excel log for details
 6. If iCloud **Optimize iPhone Storage** is on, some photos may not be fully on-device
+
+**Sort categories**
             """
         )
-        st.markdown("**Sort categories**")
         for category, extensions in CATEGORY_EXTENSIONS.items():
             st.write(f"- **{category}**: {', '.join(sorted(extensions))}")
 
-    mode = st.radio(
-        "What do you want to do?",
-        options=[
-            "Copy from iPhone to laptop",
-            "Sort files already on laptop",
-        ],
-        horizontal=False,
+    copy_tab, sort_tab = st.tabs(
+        [
+            "1. Copy files",
+            "2. Sort files",
+        ]
     )
 
-    st.divider()
-    if mode == "Copy from iPhone to laptop":
+    with copy_tab:
+        st.header("Copy files")
+        st.caption("Copy from iPhone → choose destination folder on this laptop.")
+        st.divider()
         render_copy_from_iphone()
-    else:
+
+    with sort_tab:
+        st.header("Sort files")
+        st.caption(
+            "Organize files already on the laptop into Images, Videos, Documents, Excel, PDF, Other."
+        )
+        st.divider()
         render_sort_local()
 
 
