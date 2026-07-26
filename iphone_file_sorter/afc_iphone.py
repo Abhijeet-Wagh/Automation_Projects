@@ -349,7 +349,7 @@ async def _collect_files(afc, remote_dir: str) -> list[str]:
 
 async def _iter_files(afc, remote_dir: str):
     """Yield file paths under remote_dir as they are discovered (no full pre-scan)."""
-    root = remote_dir if remote_dir else ""
+    root = (remote_dir or "").strip("/")
     try:
         if root and not await _isdir(afc, root):
             try:
@@ -361,13 +361,12 @@ async def _iter_files(afc, remote_dir: str):
     except Exception:
         return
 
-    walk_root = root if root else ""
+    # AFC walk wants "." for media root; normalize yielded paths.
+    walk_root = root if root else "."
     async for dirpath, _dirnames, filenames in afc.walk(walk_root):
+        norm_dir = "" if dirpath in {"", "."} else str(dirpath).lstrip("./")
         for filename in filenames:
-            if dirpath in {"", "."}:
-                yield filename
-            else:
-                yield posixpath.join(dirpath, filename)
+            yield posixpath.join(norm_dir, filename) if norm_dir else filename
 
 
 async def _immediate_subdirs(afc, remote: str) -> list[str]:
