@@ -23,9 +23,15 @@ Sort files copied from an iPhone's **Internal Storage** (or any folder tree) int
 3. Wait for the browser to open (usually http://localhost:8501)
 4. Choose **Copy from iPhone to laptop**
 5. Click **Refresh devices** → select your iPhone → **Load folders from iPhone**
-6. Select folders to copy
+6. Pick a **batch** of folders (`Next batch`, `Select all remaining`, or manual multi-select)
 7. Click **Browse** next to **Paste to folder on laptop** and choose a destination
-8. Click **Copy to laptop**
+8. Click **Copy this batch to laptop**
+
+Behavior:
+- Copies **file-by-file**
+- If one file fails, it is **skipped** and the next file continues
+- An **Excel log** is written in the destination folder (`iphone_copy_log_YYYYMMDD_HHMMSS.xlsx`) with failed file details (source path, destination path, error)
+- Use **Next batch** again for the remaining folders
 
 Optional: check **Also sort…** to organize into Images/Videos/Documents/Excel/PDF/Other after copy.
 

@@ -18,7 +18,7 @@ from sort_files import CATEGORY_EXTENSIONS, categorize, iter_source_files, sort_
 try:
     from windows_iphone import (
         WindowsShellError,
-        copy_named_items_to_folder,
+        copy_folders_file_by_file,
         is_windows,
         list_iphone_media_folders,
         list_portable_apple_devices,
@@ -35,7 +35,7 @@ except Exception:  # pragma: no cover - import safety on non-Windows
     def list_iphone_media_folders(_device_name: str) -> list[str]:
         return []
 
-    def copy_named_items_to_folder(*_args, **_kwargs):
+    def copy_folders_file_by_file(*_args, **_kwargs):
         raise RuntimeError("iPhone copy is only available on Windows.")
 
 
@@ -55,6 +55,9 @@ def _init_state() -> None:
         "sort_destination": "",
         "selected_device": "",
         "iphone_folders": [],
+        "ms_folders": [],
+        "completed_folders": [],
+        "batch_size": 5,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -120,11 +123,61 @@ def validate_local_paths(source: Path, destination: Path) -> str | None:
         return None
 
 
+def render_batch_folder_picker(folders: list[str]) -> list[str]:
+    """Folder multiselect with batch helpers (select all / clear / next batch)."""
+    st.markdown("#### Choose folders for this batch")
+    remaining = [f for f in folders if f not in st.session_state["completed_folders"]]
+    done_count = len(st.session_state["completed_folders"])
+    st.caption(
+        f"{len(folders)} folders total · {done_count} already completed in this session · "
+        f"{len(remaining)} remaining"
+    )
+
+    batch_size = st.number_input(
+        "Batch size (for Next batch)",
+        min_value=1,
+        max_value=max(1, len(folders)),
+        value=int(st.session_state.get("batch_size", 5)),
+        step=1,
+        help="How many remaining folders to select when you click Next batch.",
+    )
+    st.session_state["batch_size"] = int(batch_size)
+
+    b1, b2, b3, b4 = st.columns(4)
+    if b1.button("Select all remaining", use_container_width=True):
+        st.session_state["ms_folders"] = remaining
+        st.rerun()
+    if b2.button("Next batch", use_container_width=True):
+        st.session_state["ms_folders"] = remaining[: int(batch_size)]
+        st.rerun()
+    if b3.button("Clear selection", use_container_width=True):
+        st.session_state["ms_folders"] = []
+        st.rerun()
+    if b4.button("Reset completed", use_container_width=True):
+        st.session_state["completed_folders"] = []
+        st.rerun()
+
+    # Drop stale selections if the iPhone folder list changed
+    current = [f for f in st.session_state.get("ms_folders", []) if f in folders]
+    if current != list(st.session_state.get("ms_folders", [])):
+        st.session_state["ms_folders"] = current
+
+    selected = st.multiselect(
+        "Folders to copy in this batch",
+        options=folders,
+        key="ms_folders",
+        help="Select any subset. Use Next batch to grab the next N remaining folders.",
+    )
+    if selected:
+        st.info(f"This batch will copy **{len(selected)}** folder(s).")
+    return selected
+
+
 def render_copy_from_iphone() -> None:
     st.subheader("Copy from iPhone → laptop")
     st.write(
-        "Select the connected iPhone, choose folders to copy, and pick where to paste "
-        "them on this laptop."
+        "Select folders in batches, copy file-by-file (auto-skip failures), "
+        "and get an Excel log of anything that could not be copied."
     )
 
     if not is_windows():
@@ -145,6 +198,7 @@ def render_copy_from_iphone() -> None:
 
     if refresh:
         st.session_state["iphone_folders"] = []
+        st.session_state["ms_folders"] = []
 
     if not devices:
         st.warning(
@@ -170,6 +224,7 @@ def render_copy_from_iphone() -> None:
         try:
             with st.spinner("Reading folders from iPhone..."):
                 st.session_state["iphone_folders"] = list_iphone_media_folders(device)
+                st.session_state["ms_folders"] = []
         except WindowsShellError as exc:
             st.error(str(exc))
             st.session_state["iphone_folders"] = []
@@ -177,12 +232,7 @@ def render_copy_from_iphone() -> None:
     folders = st.session_state.get("iphone_folders") or []
     if folders:
         st.success(f"Found {len(folders)} folders on the iPhone.")
-        selected_folders = st.multiselect(
-            "Folders to copy",
-            options=folders,
-            default=folders,
-            help="Tip: if Explorer copy errors occur, select fewer folders at a time.",
-        )
+        selected_folders = render_batch_folder_picker(folders)
     else:
         selected_folders = []
         st.info("Click **Load folders from iPhone** to list Internal Storage folders.")
@@ -192,6 +242,14 @@ def render_copy_from_iphone() -> None:
         state_key="copy_destination",
         placeholder=r"C:\Users\YourName\Documents\iPhone_Copy",
         help_text="Files/folders from the iPhone will be copied here.",
+    )
+
+    file_timeout = st.slider(
+        "Per-file wait timeout (seconds)",
+        min_value=15,
+        max_value=300,
+        value=90,
+        help="If a file doesn’t finish copying in time, it is logged as failed and skipped.",
     )
 
     also_sort = st.checkbox(
@@ -208,13 +266,12 @@ def render_copy_from_iphone() -> None:
         )
 
     st.caption(
-        "Windows may show its normal copy dialog. If you see "
-        "“The requested value cannot be determined”, skip the bad file and continue, "
-        "or copy fewer folders. Keep the iPhone unlocked."
+        "Failed files are skipped automatically. An Excel log is saved in the destination "
+        "folder with source path, destination path, and error details."
     )
 
     do_copy = st.button(
-        "Copy to laptop",
+        "Copy this batch to laptop",
         type="primary",
         use_container_width=True,
         disabled=not (selected_folders and destination),
@@ -228,23 +285,21 @@ def render_copy_from_iphone() -> None:
     status = st.empty()
 
     def on_progress(name: str, index: int, total: int, stage: str) -> None:
-        fraction = 0 if total == 0 else (index - (0 if stage == "done" else 1)) / total
-        if stage == "done":
-            fraction = index / total
+        fraction = 0 if total == 0 else index / total
         progress.progress(
             min(max(fraction, 0.0), 1.0),
-            text=f"{index}/{total}: {name} ({stage})",
+            text=f"{index}/{total}: {stage} · {name}",
         )
-        status.write(f"{stage.title()}: `{name}`")
+        status.write(f"**{stage.title()}:** `{name}`")
 
     try:
-        with st.spinner("Copying from iPhone via Windows Shell..."):
-            copied = copy_named_items_to_folder(
+        with st.spinner("Copying files from iPhone (skipping failures)..."):
+            result = copy_folders_file_by_file(
                 device,
                 selected_folders,
                 dest_path,
+                file_timeout_sec=float(file_timeout),
                 on_progress=on_progress,
-                silent=False,
             )
     except WindowsShellError as exc:
         st.error(str(exc))
@@ -253,8 +308,40 @@ def render_copy_from_iphone() -> None:
         st.error(f"Copy failed: {exc}")
         return
 
-    progress.progress(1.0, text="Copy finished")
-    st.success(f"Copied {len(copied)} item(s) to `{dest_path.resolve()}`")
+    # Mark batch folders completed in this session (for Next batch)
+    completed = set(st.session_state.get("completed_folders", []))
+    completed.update(selected_folders)
+    st.session_state["completed_folders"] = sorted(completed)
+
+    progress.progress(1.0, text="Batch finished")
+    ok_n = len(result.succeeded)
+    fail_n = len(result.failed)
+    st.success(
+        f"Batch complete: **{ok_n}** copied, **{fail_n}** skipped/failed."
+    )
+    st.write(f"Files saved under: `{dest_path.resolve()}`")
+
+    if result.log_path and result.log_path.exists():
+        st.write(f"Excel log: `{result.log_path.resolve()}`")
+        try:
+            data = result.log_path.read_bytes()
+            st.download_button(
+                "Download Excel log",
+                data=data,
+                file_name=result.log_path.name,
+                mime=(
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                ),
+                use_container_width=True,
+            )
+        except OSError:
+            pass
+
+    if result.failed:
+        st.subheader("Failed / skipped files")
+        st.dataframe(result.failed, use_container_width=True)
+    else:
+        st.info("No failed files in this batch.")
 
     if also_sort:
         if not sort_destination.strip():
