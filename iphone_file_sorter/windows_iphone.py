@@ -10,10 +10,11 @@ Requires: pywin32 (Windows only)
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from copy_log import default_log_path, write_copy_excel_log
 
@@ -43,6 +44,31 @@ class CopyResult:
     selected_folders: list[str] = field(default_factory=list)
 
 
+@contextmanager
+def _com_initialized() -> Iterator[None]:
+    """
+    Initialize COM for the current thread.
+
+    Streamlit runs script code off the main thread, so win32com calls need
+    explicit CoInitialize or they raise: CoInitialize has not been called.
+    """
+    try:
+        import pythoncom  # type: ignore
+    except ImportError as exc:
+        raise WindowsShellError(
+            "pywin32 is required on Windows. Run: python -m pip install pywin32"
+        ) from exc
+
+    pythoncom.CoInitialize()
+    try:
+        yield
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
 def _shell():
     try:
         import win32com.client  # type: ignore
@@ -64,18 +90,19 @@ def list_portable_apple_devices() -> list[str]:
     if not is_windows():
         return []
 
-    shell = _shell()
-    computer = shell.NameSpace(THIS_PC)
-    if computer is None:
-        return []
+    with _com_initialized():
+        shell = _shell()
+        computer = shell.NameSpace(THIS_PC)
+        if computer is None:
+            return []
 
-    names: list[str] = []
-    for item in computer.Items():
-        name = str(item.Name)
-        lower = name.lower()
-        if "iphone" in lower or "ipad" in lower or "apple" in lower:
-            names.append(name)
-    return names
+        names: list[str] = []
+        for item in computer.Items():
+            name = str(item.Name)
+            lower = name.lower()
+            if "iphone" in lower or "ipad" in lower or "apple" in lower:
+                names.append(name)
+        return names
 
 
 def _device_folder(device_name: str) -> Any:
@@ -124,8 +151,9 @@ def find_internal_storage(device_name: str) -> tuple[Any, str]:
 
 def list_iphone_media_folders(device_name: str) -> list[str]:
     """List copyable folders under the iPhone media root."""
-    root, _ = find_internal_storage(device_name)
-    return sorted(list_child_names(root))
+    with _com_initialized():
+        root, _ = find_internal_storage(device_name)
+        return sorted(list_child_names(root))
 
 
 def _is_folder_item(item: Any) -> bool:
@@ -236,105 +264,106 @@ def copy_folders_file_by_file(
     if log_path is None:
         log_path = default_log_path(destination)
 
-    shell = _shell()
-    media_root, media_label = find_internal_storage(device_name)
+    with _com_initialized():
+        shell = _shell()
+        media_root, media_label = find_internal_storage(device_name)
 
-    # Build job list: (top_folder, relative_path)
-    normalized_jobs: list[tuple[str, str]] = []
-    failed: list[dict[str, Any]] = []
-    for folder_name in folder_names:
-        try:
-            folder = get_child_folder(media_root, folder_name)
-        except WindowsShellError as exc:
-            failed.append(
-                {
-                    "timestamp": _now(),
-                    "device": device_name,
-                    "source_folder": folder_name,
-                    "file_name": "",
-                    "relative_path": "",
-                    "source_path": f"{device_name}/{media_label}/{folder_name}",
-                    "destination_path": str(destination / folder_name),
-                    "error": str(exc),
-                    "status": "Skipped",
-                }
-            )
-            continue
-
-        for rel in _enumerate_relative_files(folder):
-            normalized_jobs.append((folder_name, rel))
-
-    succeeded: list[dict[str, Any]] = []
-    total = len(normalized_jobs)
-
-    for index, (folder_name, rel) in enumerate(normalized_jobs, start=1):
-        file_name = Path(rel).name
-        source_path = f"{device_name}/{media_label}/{folder_name}/{rel}"
-        dest_file = destination / folder_name / Path(rel)
-        dest_file.parent.mkdir(parents=True, exist_ok=True)
-
-        label = f"{folder_name}/{rel}"
-        if on_progress:
-            on_progress(label, index, total, "copying")
-
-        try:
-            item, _parent = _resolve_file_item(media_root, folder_name, rel)
-            dest_ns = shell.NameSpace(str(dest_file.parent.resolve()))
-            if dest_ns is None:
-                raise WindowsShellError(
-                    f"Could not open destination folder: {dest_file.parent}"
+        # Build job list: (top_folder, relative_path)
+        normalized_jobs: list[tuple[str, str]] = []
+        failed: list[dict[str, Any]] = []
+        for folder_name in folder_names:
+            try:
+                folder = get_child_folder(media_root, folder_name)
+            except WindowsShellError as exc:
+                failed.append(
+                    {
+                        "timestamp": _now(),
+                        "device": device_name,
+                        "source_folder": folder_name,
+                        "file_name": "",
+                        "relative_path": "",
+                        "source_path": f"{device_name}/{media_label}/{folder_name}",
+                        "destination_path": str(destination / folder_name),
+                        "error": str(exc),
+                        "status": "Skipped",
+                    }
                 )
+                continue
 
-            # Remove incomplete leftover from a previous failed attempt
-            if dest_file.exists():
-                try:
-                    if dest_file.stat().st_size == 0:
-                        dest_file.unlink()
-                except OSError:
-                    pass
+            for rel in _enumerate_relative_files(folder):
+                normalized_jobs.append((folder_name, rel))
 
-            dest_ns.CopyHere(item, COPY_FLAGS_SKIP)
-            ok, reason = _wait_for_file(dest_file, timeout_sec=file_timeout_sec)
-            if not ok:
-                # Clean empty stub if present
-                try:
-                    if dest_file.exists() and dest_file.stat().st_size == 0:
-                        dest_file.unlink()
-                except OSError:
-                    pass
-                raise WindowsShellError(reason or "Copy failed")
+        succeeded: list[dict[str, Any]] = []
+        total = len(normalized_jobs)
 
-            succeeded.append(
-                {
-                    "timestamp": _now(),
-                    "device": device_name,
-                    "source_folder": folder_name,
-                    "file_name": file_name,
-                    "relative_path": rel,
-                    "destination_path": str(dest_file),
-                    "status": "Copied",
-                }
-            )
+        for index, (folder_name, rel) in enumerate(normalized_jobs, start=1):
+            file_name = Path(rel).name
+            source_path = f"{device_name}/{media_label}/{folder_name}/{rel}"
+            dest_file = destination / folder_name / Path(rel)
+            dest_file.parent.mkdir(parents=True, exist_ok=True)
+
+            label = f"{folder_name}/{rel}"
             if on_progress:
-                on_progress(label, index, total, "done")
+                on_progress(label, index, total, "copying")
 
-        except Exception as exc:  # noqa: BLE001 - skip and continue
-            failed.append(
-                {
-                    "timestamp": _now(),
-                    "device": device_name,
-                    "source_folder": folder_name,
-                    "file_name": file_name,
-                    "relative_path": rel,
-                    "source_path": source_path,
-                    "destination_path": str(dest_file),
-                    "error": str(exc),
-                    "status": "Skipped",
-                }
-            )
-            if on_progress:
-                on_progress(label, index, total, "skipped")
-            continue
+            try:
+                item, _parent = _resolve_file_item(media_root, folder_name, rel)
+                dest_ns = shell.NameSpace(str(dest_file.parent.resolve()))
+                if dest_ns is None:
+                    raise WindowsShellError(
+                        f"Could not open destination folder: {dest_file.parent}"
+                    )
+
+                # Remove incomplete leftover from a previous failed attempt
+                if dest_file.exists():
+                    try:
+                        if dest_file.stat().st_size == 0:
+                            dest_file.unlink()
+                    except OSError:
+                        pass
+
+                dest_ns.CopyHere(item, COPY_FLAGS_SKIP)
+                ok, reason = _wait_for_file(dest_file, timeout_sec=file_timeout_sec)
+                if not ok:
+                    # Clean empty stub if present
+                    try:
+                        if dest_file.exists() and dest_file.stat().st_size == 0:
+                            dest_file.unlink()
+                    except OSError:
+                        pass
+                    raise WindowsShellError(reason or "Copy failed")
+
+                succeeded.append(
+                    {
+                        "timestamp": _now(),
+                        "device": device_name,
+                        "source_folder": folder_name,
+                        "file_name": file_name,
+                        "relative_path": rel,
+                        "destination_path": str(dest_file),
+                        "status": "Copied",
+                    }
+                )
+                if on_progress:
+                    on_progress(label, index, total, "done")
+
+            except Exception as exc:  # noqa: BLE001 - skip and continue
+                failed.append(
+                    {
+                        "timestamp": _now(),
+                        "device": device_name,
+                        "source_folder": folder_name,
+                        "file_name": file_name,
+                        "relative_path": rel,
+                        "source_path": source_path,
+                        "destination_path": str(dest_file),
+                        "error": str(exc),
+                        "status": "Skipped",
+                    }
+                )
+                if on_progress:
+                    on_progress(label, index, total, "skipped")
+                continue
 
     write_copy_excel_log(
         log_path,
