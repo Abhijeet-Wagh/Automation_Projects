@@ -159,30 +159,24 @@ def _on_tree_checkbox_change(path: str) -> None:
 
 
 def _render_tree_node(node: dict, tree_root: dict, depth: int = 0) -> None:
+    del tree_root  # cascade uses session tree via on_change
     path = node["path"]
     children = node.get("children") or []
-    selected = set(st.session_state.get("tree_selected", []))
-    checked = path in selected
     indent = "  " * depth  # em-space indent for tree levels
     child_count = len(children)
     suffix = f"  ({child_count} subfolders)" if child_count else ""
     icon = "📁" if depth == 0 or child_count else "📂"
     label = f"{indent}{icon} {node['name']}{suffix}"
 
-    key = f"tree_cb::{path}"
-    # Initialize only if missing — never overwrite after widget exists
-    if key not in st.session_state:
-        st.session_state[key] = checked
-
     st.checkbox(
         label,
-        key=key,
+        key=f"tree_cb::{path}",
         on_change=_on_tree_checkbox_change,
         args=(path,),
     )
 
     for child in children:
-        _render_tree_node(child, tree_root, depth + 1)
+        _render_tree_node(child, node, depth + 1)
 
 
 def render_folder_tree_picker(tree: dict, device_name: str) -> list[str]:
