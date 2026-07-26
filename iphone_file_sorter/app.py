@@ -69,20 +69,71 @@ def _pymobiledevice3_status() -> tuple[bool, str]:
 
 
 def _install_pymobiledevice3() -> tuple[bool, str]:
-    cmd = [_python_exe(), "-m", "pip", "install", "-U", "pymobiledevice3"]
-    try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
+    """
+    Install pymobiledevice3 into the current interpreter.
+
+    On Windows + Python 3.13, dependency lzfse often has no wheel and fails to
+    compile. Prefer binary wheels; otherwise return guidance for a 3.12 env.
+    """
+    py_version = sys.version_info
+    logs: list[str] = [f"Python: {_python_exe()}", f"Version: {sys.version}"]
+
+    if py_version >= (3, 13):
+        guidance = (
+            "Your Anaconda Python is 3.13+. The iPhone copy library needs "
+            "dependency 'lzfse', which has no Windows wheel for 3.13 and fails "
+            "to compile.\n\n"
+            "Create a Python 3.12 environment (recommended):\n"
+            "  conda create -n iphone_copy python=3.12 -y\n"
+            "  conda activate iphone_copy\n"
+            "  cd %USERPROFILE%\\Documents\\Automation_Projects\\iphone_file_sorter\n"
+            "  python -m pip install -r requirements.txt\n"
+            "  python -m streamlit run app.py\n"
         )
-    except Exception as exc:  # noqa: BLE001
-        return False, f"Failed to run pip: {exc}"
-    output = (completed.stdout or "") + "\n" + (completed.stderr or "")
-    if completed.returncode == 0:
-        return True, output.strip() or "Install finished."
-    return False, output.strip() or f"pip exit code {completed.returncode}"
+        return False, guidance
+
+    commands = [
+        [_python_exe(), "-m", "pip", "install", "-U", "pip", "setuptools", "wheel"],
+        # Prefer binary wheel for lzfse (avoids MSVC build)
+        [
+            _python_exe(),
+            "-m",
+            "pip",
+            "install",
+            "-U",
+            "lzfse",
+            "--only-binary=:all:",
+        ],
+        [_python_exe(), "-m", "pip", "install", "-U", "pymobiledevice3"],
+    ]
+
+    for cmd in commands:
+        logs.append("\n$ " + " ".join(cmd))
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logs.append(f"Failed to run command: {exc}")
+            return False, "\n".join(logs)
+        out = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
+        logs.append(out or f"(exit {completed.returncode})")
+        # lzfse binary install may fail on some platforms; continue and let
+        # pymobiledevice3 try (AFC itself does not require lzfse).
+        if completed.returncode != 0 and "pymobiledevice3" in cmd[-1]:
+            logs.append(
+                "\nIf this failed because of lzfse/build tools, use Python 3.12:\n"
+                "  conda create -n iphone_copy python=3.12 -y\n"
+                "  conda activate iphone_copy\n"
+                "  python -m pip install -r requirements.txt\n"
+                "  python -m streamlit run app.py"
+            )
+            return False, "\n".join(logs)
+
+    return True, "\n".join(logs)
 
 
 st.set_page_config(
@@ -334,25 +385,45 @@ def render_copy_from_iphone() -> None:
         st.error("Apple AFC support is not ready in the Python that is running this UI.")
         st.code(detail, language="text")
         st.write(f"This UI is running with: `{_python_exe()}`")
-        st.write("Install into **this exact Python** using the button below, or run:")
-        st.code(
-            f'"{_python_exe()}" -m pip install -U pymobiledevice3',
-            language="bash",
-        )
-        if st.button("Install pymobiledevice3 into this Python", type="primary"):
-            with st.spinner("Installing pymobiledevice3..."):
-                success, output = _install_pymobiledevice3()
-            if success:
-                st.success(
-                    "Install finished. Stop the app (Ctrl+C), start it again, then refresh."
-                )
-            else:
-                st.error("Install failed. See output below.")
-            st.code(output[-4000:] if output else "(no output)", language="text")
+        st.write(f"Python version: `{sys.version.split()[0]}`")
+
+        if sys.version_info >= (3, 13):
+            st.warning(
+                "Python 3.13 on Windows cannot install `lzfse` (needed by some "
+                "iPhone tooling). Use a **Python 3.12** conda environment."
+            )
+            st.code(
+                "\n".join(
+                    [
+                        "conda create -n iphone_copy python=3.12 -y",
+                        "conda activate iphone_copy",
+                        r"cd %USERPROFILE%\Documents\Automation_Projects\iphone_file_sorter",
+                        "python -m pip install -r requirements.txt",
+                        "python -m streamlit run app.py",
+                    ]
+                ),
+                language="bash",
+            )
+        else:
+            st.write("Install into **this exact Python** using the button below, or run:")
+            st.code(
+                f'"{_python_exe()}" -m pip install -U pymobiledevice3',
+                language="bash",
+            )
+            if st.button("Install pymobiledevice3 into this Python", type="primary"):
+                with st.spinner("Installing pymobiledevice3..."):
+                    success, output = _install_pymobiledevice3()
+                if success:
+                    st.success(
+                        "Install finished. Stop the app (Ctrl+C), start it again, then refresh."
+                    )
+                else:
+                    st.error("Install failed. See output below.")
+                st.code(output[-5000:] if output else "(no output)", language="text")
+
         st.caption(
-            "Important: install and run Streamlit with the same Anaconda Python. "
-            "If you installed in one environment but launched Streamlit from another, "
-            "this error will continue."
+            "Important: install and run Streamlit with the same conda environment. "
+            "Python 3.12 is recommended on Windows."
         )
         return
 

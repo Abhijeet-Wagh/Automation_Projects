@@ -27,7 +27,18 @@ The UI has **two panels (tabs)**:
 Uses **Apple AFC** (via `pymobiledevice3`) to copy real files from iPhone `DCIM`.  
 Windows MTP/Explorer-style copy is avoided because it often creates **empty folders**.
 
-1. Install deps (Anaconda Prompt): `python -m pip install -r requirements.txt`
+1. On Windows, prefer **Python 3.12** (3.13 often fails installing `lzfse`).
+   Easiest: double-click `Start_UI_Py312.bat`  
+   Or in Anaconda Prompt:
+
+   ```bat
+   conda create -n iphone_copy python=3.12 -y
+   conda activate iphone_copy
+   cd %USERPROFILE%\Documents\Automation_Projects\iphone_file_sorter
+   python -m pip install -r requirements.txt
+   python -m streamlit run app.py
+   ```
+
 2. Unlock iPhone → tap **Trust**
 3. **Refresh devices** → select iPhone → **Load DCIM folder tree**
 4. Check folders → **Browse** destination → **Copy selected folders to laptop**
