@@ -481,8 +481,8 @@ def main() -> None:
 1. Unlock iPhone → tap **Trust this computer**
 2. Turn off **Low Power Mode**, set **Auto-Lock** as long as possible
 3. Keep the screen awake while copying
-4. Prefer copying **a few folders at a time**
-5. If a file errors with *“The requested value cannot be determined”*, skip it and continue
+4. Copy in **batches** (use **Next batch**)
+5. Failed files are **auto-skipped**; check the Excel log for details
 6. If iCloud **Optimize iPhone Storage** is on, some photos may not be fully on-device
             """
         )
