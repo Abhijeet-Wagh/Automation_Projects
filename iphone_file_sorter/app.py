@@ -155,6 +155,7 @@ def _init_state() -> None:
         "afc_serial": "",
         "iphone_tree": None,
         "tree_selected": [],
+        "tree_expanded": [],
         "completed_folders": [],
         "batch_size": 5,
     }
@@ -257,24 +258,77 @@ def _on_tree_checkbox_change(path: str) -> None:
     _sync_tree_checkbox_keys(tree, updated)
 
 
+def _expand_key(path: str) -> str:
+    return f"tree_exp::{path if path else '__root__'}"
+
+
+def _is_expanded(path: str) -> bool:
+    return path in set(st.session_state.get("tree_expanded", []))
+
+
+def _toggle_expanded(path: str) -> None:
+    expanded = set(st.session_state.get("tree_expanded", []))
+    if path in expanded:
+        expanded.discard(path)
+    else:
+        expanded.add(path)
+    st.session_state["tree_expanded"] = sorted(expanded)
+
+
+def _set_expanded_paths(paths: list[str]) -> None:
+    st.session_state["tree_expanded"] = sorted(set(paths))
+
+
 def _render_tree_node(node: dict, depth: int = 0) -> None:
+    """Render one tree row with expand/collapse arrow + checkbox."""
     path = node["path"]
     children = node.get("children") or []
-    indent = "  " * depth  # em-space indent for tree levels
+    has_children = bool(children)
+    is_open = _is_expanded(path)
+
     child_count = len(children)
     suffix = f"  ({child_count} subfolders)" if child_count else ""
-    icon = "📁" if depth == 0 or child_count else "📂"
-    label = f"{indent}{icon} {node['name']}{suffix}"
+    icon = "📁" if has_children or depth == 0 else "📂"
+    label = f"{icon} {node['name']}{suffix}"
 
-    st.checkbox(
-        label,
-        key=f"tree_cb::{path}",
-        on_change=_on_tree_checkbox_change,
-        args=(path,),
-    )
+    # Indent | arrow | checkbox
+    indent_weight = max(0.2, depth * 0.35)
+    arrow_weight = 0.45
+    check_weight = max(3.5, 6.0 - indent_weight)
+    c_indent, c_arrow, c_check = st.columns([indent_weight, arrow_weight, check_weight])
 
-    for child in children:
-        _render_tree_node(child, depth + 1)
+    with c_indent:
+        st.write("")
+
+    with c_arrow:
+        if has_children:
+            arrow = "▼" if is_open else "▶"
+            if st.button(
+                arrow,
+                key=_expand_key(path),
+                help="Expand / collapse folder",
+                use_container_width=True,
+            ):
+                _toggle_expanded(path)
+                st.rerun()
+        else:
+            # Leaf marker (no expand arrow)
+            st.markdown(
+                "<div style='text-align:center; opacity:0.45;'>•</div>",
+                unsafe_allow_html=True,
+            )
+
+    with c_check:
+        st.checkbox(
+            label,
+            key=f"tree_cb::{path}",
+            on_change=_on_tree_checkbox_change,
+            args=(path,),
+        )
+
+    if has_children and is_open:
+        for child in children:
+            _render_tree_node(child, depth + 1)
 
 
 def render_folder_tree_picker(
@@ -286,8 +340,8 @@ def render_folder_tree_picker(
     """Checkbox tree with parent→child cascade selection."""
     st.markdown("#### iPhone folder tree")
     st.caption(
-        "Check a parent folder to select its subfolders. "
-        "Uncheck any folder you do not want to copy."
+        "Use ▶ / ▼ to expand or collapse folders. "
+        "Check a parent folder to select its subfolders."
     )
 
     top_level = [c["path"] for c in (tree.get("children") or [])]
@@ -330,14 +384,29 @@ def render_folder_tree_picker(
         st.session_state["completed_folders"] = []
         st.rerun()
 
+    e1, e2 = st.columns(2)
+    if e1.button("Expand all", use_container_width=True):
+        _set_expanded_paths(all_paths(tree))
+        st.rerun()
+    if e2.button("Collapse all", use_container_width=True):
+        # Keep only the root visible/collapsed-closed
+        _set_expanded_paths([])
+        st.rerun()
+
     if allow_lazy_subfolders and device_name:
         st.caption("Lazy MTP subfolder loading is disabled in AFC mode.")
 
-    # Prune invalid selections if tree reloaded (before checkbox widgets exist)
+    # Prune invalid selections / expanded paths if tree reloaded
     valid = set(all_paths(tree))
     selected_now = {p for p in st.session_state.get("tree_selected", []) if p in valid}
     if sorted(selected_now) != list(st.session_state.get("tree_selected", [])):
         st.session_state["tree_selected"] = sorted(selected_now)
+    expanded_now = [p for p in st.session_state.get("tree_expanded", []) if p in valid]
+    # Default: expand root so first level is visible
+    if not expanded_now and tree.get("path") in valid:
+        expanded_now = [tree["path"]]
+    st.session_state["tree_expanded"] = expanded_now
+
     # Keep widget keys in sync before instantiating checkboxes
     _sync_tree_checkbox_keys(tree, set(st.session_state.get("tree_selected", [])))
 
@@ -378,6 +447,7 @@ def render_copy_from_iphone() -> None:
     if refresh:
         st.session_state["iphone_tree"] = None
         st.session_state["tree_selected"] = []
+        st.session_state["tree_expanded"] = []
         st.session_state["afc_serial"] = ""
 
     ok, detail = _pymobiledevice3_status()
@@ -460,6 +530,8 @@ def render_copy_from_iphone() -> None:
                 tree = list_afc_folder_tree(serial, max_depth=2)
                 st.session_state["iphone_tree"] = tree
                 st.session_state["tree_selected"] = []
+                # Expand root so first-level folders are visible
+                st.session_state["tree_expanded"] = [tree.get("path", "")]
                 _sync_tree_checkbox_keys(tree, set())
         except AfcError as exc:
             st.error(str(exc))
