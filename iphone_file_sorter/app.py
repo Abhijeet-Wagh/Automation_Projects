@@ -135,9 +135,27 @@ def validate_local_paths(source: Path, destination: Path) -> str | None:
 
 
 def _sync_tree_checkbox_keys(tree: dict, selected: set[str]) -> None:
-    """Keep checkbox widget keys aligned with selection set."""
+    """
+    Align checkbox widget keys with selection set.
+
+    Must only be called before those checkbox widgets are instantiated
+    (e.g. in button handlers before st.rerun, or in on_change callbacks).
+    """
     for path in all_paths(tree):
         st.session_state[f"tree_cb::{path}"] = path in selected
+
+
+def _on_tree_checkbox_change(path: str) -> None:
+    """Cascade parent/child selection safely via Streamlit on_change."""
+    tree = st.session_state.get("iphone_tree")
+    if not tree:
+        return
+    checked = bool(st.session_state.get(f"tree_cb::{path}", False))
+    selected = set(st.session_state.get("tree_selected", []))
+    updated = apply_check(selected, tree, path, checked)
+    st.session_state["tree_selected"] = sorted(updated)
+    # Safe here: on_change runs before widgets are instantiated
+    _sync_tree_checkbox_keys(tree, updated)
 
 
 def _render_tree_node(node: dict, tree_root: dict, depth: int = 0) -> None:
@@ -152,15 +170,16 @@ def _render_tree_node(node: dict, tree_root: dict, depth: int = 0) -> None:
     label = f"{indent}{icon} {node['name']}{suffix}"
 
     key = f"tree_cb::{path}"
+    # Initialize only if missing — never overwrite after widget exists
     if key not in st.session_state:
         st.session_state[key] = checked
 
-    new_val = st.checkbox(label, key=key)
-    if new_val != checked:
-        updated = apply_check(selected, tree_root, path, new_val)
-        st.session_state["tree_selected"] = sorted(updated)
-        _sync_tree_checkbox_keys(tree_root, updated)
-        st.rerun()
+    st.checkbox(
+        label,
+        key=key,
+        on_change=_on_tree_checkbox_change,
+        args=(path,),
+    )
 
     for child in children:
         _render_tree_node(child, tree_root, depth + 1)
@@ -257,12 +276,13 @@ def render_folder_tree_picker(tree: dict, device_name: str) -> list[str]:
             except WindowsShellError as exc:
                 st.error(str(exc))
 
-    # Prune invalid selections if tree reloaded
+    # Prune invalid selections if tree reloaded (before checkbox widgets exist)
     valid = set(all_paths(tree))
     selected_now = {p for p in st.session_state.get("tree_selected", []) if p in valid}
     if sorted(selected_now) != list(st.session_state.get("tree_selected", [])):
         st.session_state["tree_selected"] = sorted(selected_now)
-        _sync_tree_checkbox_keys(tree, selected_now)
+    # Keep widget keys in sync before instantiating checkboxes
+    _sync_tree_checkbox_keys(tree, set(st.session_state.get("tree_selected", [])))
 
     with st.container(border=True):
         _render_tree_node(tree, tree)
