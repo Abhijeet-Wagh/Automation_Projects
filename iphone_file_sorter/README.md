@@ -18,11 +18,18 @@ Sort files copied from an iPhone's **Internal Storage** (or any folder tree) int
 ## Quick start — Web UI (recommended)
 
 ### Easiest on Windows
-1. Copy iPhone Internal Storage folders to a local path first.
+1. Connect and unlock your iPhone (tap **Trust**)
 2. Double-click `Start_UI.bat`
 3. Wait for the browser to open (usually http://localhost:8501)
-4. Paste **Source** and **Destination** folder paths
-5. Click **Preview**, then **Start sorting** (keep Dry run on the first time)
+4. Choose **Copy from iPhone to laptop**
+5. Click **Refresh devices** → select your iPhone → **Load folders from iPhone**
+6. Select folders to copy
+7. Click **Browse** next to **Paste to folder on laptop** and choose a destination
+8. Click **Copy to laptop**
+
+Optional: check **Also sort…** to organize into Images/Videos/Documents/Excel/PDF/Other after copy.
+
+You can also use **Sort files already on laptop** with **Browse** buttons for source and destination.
 
 ### Or from a terminal
 ```bat
