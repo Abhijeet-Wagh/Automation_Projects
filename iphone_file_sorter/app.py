@@ -512,7 +512,10 @@ def render_copy_from_iphone() -> None:
 
     st.info(
         "Windows Explorer MTP copy is unreliable (empty folders). "
-        "This app now uses **Apple AFC** via pymobiledevice3 to pull actual files from DCIM."
+        "This app uses **Apple AFC** via pymobiledevice3 to pull real files from the "
+        "iPhone **Media** area (DCIM, Downloads, Recordings, …). "
+        "WhatsApp/Telegram appear under **Apps** only if iOS allows USB access "
+        "(many apps block this — Explorer’s WhatsApp folder is a different MTP view)."
     )
 
     top = st.columns([1, 1])
@@ -601,15 +604,19 @@ def render_copy_from_iphone() -> None:
     serial = serials[labels.index(choice)]
     st.session_state["afc_serial"] = serial
 
-    load = st.button("Load DCIM folder tree from iPhone", use_container_width=True)
+    load = st.button("Load folder tree from iPhone", use_container_width=True)
     if load:
         try:
-            with st.spinner("Reading DCIM folders via Apple AFC..."):
-                tree = list_afc_folder_tree(serial, max_depth=2)
+            with st.spinner("Reading Media + Apps folders via Apple AFC..."):
+                tree = list_afc_folder_tree(serial, max_depth=3)
                 st.session_state["iphone_tree"] = tree
                 st.session_state["tree_selected"] = []
-                # Expand root once so first-level folders are visible
-                st.session_state["tree_expanded"] = [tree.get("path", "")]
+                # Expand root + Media so DCIM and siblings are visible
+                expanded = [tree.get("path", "")]
+                for child in tree.get("children") or []:
+                    if child.get("path") == "media":
+                        expanded.append(child["path"])
+                st.session_state["tree_expanded"] = expanded
                 st.session_state["tree_expand_initialized"] = True
                 _sync_tree_checkbox_keys(tree, set())
         except AfcError as exc:
@@ -620,15 +627,22 @@ def render_copy_from_iphone() -> None:
     tree = st.session_state.get("iphone_tree")
     if tree:
         st.success(
-            f"Loaded **{tree.get('name', 'DCIM')}** "
+            f"Loaded **{tree.get('name', 'iPhone')}** "
             f"({count_folders(tree)} folders) via AFC."
+        )
+        st.caption(
+            "**Why not every Explorer folder?** AFC only sees `/var/mobile/Media` "
+            "(Camera Roll / DCIM, Downloads, Voice Memos, …). "
+            "WhatsApp chat media lives in the app sandbox — it shows under **Apps** "
+            "only when iOS grants house_arrest access. If Apps is empty, use WhatsApp "
+            "**Export chat** / **Save to Photos**, or an encrypted iPhone backup tool."
         )
         selected_folders = render_folder_tree_picker(
             tree, allow_lazy_subfolders=False
         )
     else:
         selected_folders = []
-        st.info("Click **Load DCIM folder tree from iPhone** to browse folders.")
+        st.info("Click **Load folder tree from iPhone** to browse Media and Apps folders.")
 
     destination = path_with_browse(
         label="Paste to folder on laptop",
@@ -651,7 +665,10 @@ def render_copy_from_iphone() -> None:
         )
 
     st.caption(
-        "AFC copies real files. Failed items are skipped and listed in an Excel log."
+        "Copy runs **file-by-file**: progress shows file N of total. "
+        "If a file hangs, it times out, is skipped, and the rest continue. "
+        "Re-run the same selection to resume (already-copied files are skipped). "
+        "Failures are listed in an Excel log."
     )
 
     has_selection = bool(selected_folders)
@@ -674,13 +691,16 @@ def render_copy_from_iphone() -> None:
     def on_progress(name: str, index: int, total: int, stage: str) -> None:
         fraction = 0 if total == 0 else index / max(total, 1)
         progress.progress(
-            min(max(fraction, 0.0), 1.0),
-            text=f"{index}/{total}: {stage} · {name}",
+            min(max(fraction, 0.0), 0.99 if stage != "done" else 1.0),
+            text=f"File {index}/{total}: {stage} · {name}",
         )
-        status.write(f"**{stage.title()}:** `{name}`")
+        status.write(f"**{stage.title()}** ({index}/{total}): `{name}`")
 
     try:
-        with st.spinner("Copying from iPhone via Apple AFC (real files)..."):
+        with st.spinner(
+            "Copying file-by-file via Apple AFC… "
+            "large videos can take a while; stuck files are skipped after a timeout."
+        ):
             result = copy_afc_folders(
                 serial,
                 selected_folders,
