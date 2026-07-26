@@ -689,23 +689,32 @@ def render_copy_from_iphone() -> None:
         return
 
     dest_path = Path(destination).expanduser()
+    if "onedrive" in str(dest_path).lower():
+        st.warning(
+            "Destination is under **OneDrive**. Cloud sync can make copies look frozen "
+            "or very slow. Prefer a local folder such as "
+            r"`C:\Users\abhij\Documents\iPhone_Copy` (outside OneDrive) or `C:\iPhone_Copy`."
+        )
     progress = st.progress(0, text="Starting AFC copy...")
     status = st.empty()
-    st.info("Keep the iPhone unlocked. Files should appear in the destination as they download.")
+    st.info(
+        "Keep the iPhone unlocked. Copy starts immediately (no full file count). "
+        "Watch this status line and the destination folder for new files."
+    )
     st.write(f"Destination: `{dest_path}`")
 
     def on_progress(name: str, index: int, total: int, stage: str) -> None:
         fraction = 0 if total == 0 else index / max(total, 1)
         progress.progress(
-            min(max(fraction, 0.0), 0.99 if stage != "done" else 1.0),
-            text=f"File {index}/{total}: {stage} · {name}",
+            min(max(fraction, 0.0), 0.99),
+            text=f"{stage} · {index}/{total} · {name}",
         )
         status.write(f"**{stage.title()}** ({index}/{total}): `{name}`")
 
     try:
         with st.spinner(
-            "Copying file-by-file via Apple AFC… "
-            "large videos can take a while; stuck files are skipped after a timeout."
+            "Copying via Apple AFC… first files should appear in the destination shortly. "
+            "Stuck files are skipped after a timeout."
         ):
             result = copy_afc_folders(
                 serial,

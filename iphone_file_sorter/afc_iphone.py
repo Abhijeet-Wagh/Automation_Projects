@@ -343,24 +343,49 @@ def list_afc_folder_tree(serial: str, *, max_depth: int = 2) -> dict:
 
 
 async def _collect_files(afc, remote_dir: str) -> list[str]:
-    """List all file paths under remote_dir (AFC paths)."""
-    files: list[str] = []
-    root = remote_dir if remote_dir else "."
-    try:
-        if not await _isdir(afc, root if root != "." else ""):
-            # Single file?
-            try:
-                await afc.stat(remote_dir)
-                return [remote_dir]
-            except Exception:
-                return []
-    except Exception:
-        return []
+    """List all file paths under remote_dir (AFC paths). Prefer _iter_files for copy."""
+    return [p async for p in _iter_files(afc, remote_dir)]
 
-    async for dirpath, _dirnames, filenames in afc.walk(root if root != "." else ""):
+
+async def _iter_files(afc, remote_dir: str):
+    """Yield file paths under remote_dir as they are discovered (no full pre-scan)."""
+    root = remote_dir if remote_dir else ""
+    try:
+        if root and not await _isdir(afc, root):
+            try:
+                await afc.stat(root)
+                yield root
+            except Exception:
+                return
+            return
+    except Exception:
+        return
+
+    walk_root = root if root else ""
+    async for dirpath, _dirnames, filenames in afc.walk(walk_root):
         for filename in filenames:
-            files.append(posixpath.join(dirpath, filename) if dirpath not in {"", "."} else filename)
-    return files
+            if dirpath in {"", "."}:
+                yield filename
+            else:
+                yield posixpath.join(dirpath, filename)
+
+
+async def _immediate_subdirs(afc, remote: str) -> list[str]:
+    """Return immediate child directory names under remote."""
+    out: list[str] = []
+    for name in await _listdir(afc, remote if remote else ""):
+        child = _join(remote, name) if remote else name
+        if await _isdir(afc, child):
+            out.append(name)
+    return out
+
+
+async def _has_immediate_files(afc, remote: str) -> bool:
+    for name in await _listdir(afc, remote if remote else ""):
+        child = _join(remote, name) if remote else name
+        if not await _isdir(afc, child):
+            return True
+    return False
 
 
 def _local_path_for(destination: Path, remote_file: str, folder_remote: str) -> Path:
@@ -398,6 +423,165 @@ async def _pull_file(afc, remote_file: str, local_file: Path) -> None:
         pulled.replace(local_file)
 
 
+async def _copy_one_remote_file(
+    afc,
+    *,
+    remote_file: str,
+    folder_remote: str,
+    destination: Path,
+    device_name: str,
+    logical_folder: str,
+    file_index: int,
+    folder_index: int,
+    folder_total: int,
+    on_progress: Callable[[str, int, int, str], None] | None,
+    succeeded: list,
+    failed: list,
+    handled_remotes: set[str],
+) -> str:
+    """
+    Copy a single remote file. Returns:
+      'ok' | 'skipped' | 'timeout' | 'disconnect' | 'error'
+    """
+    local_file = _local_path_for(destination, remote_file, folder_remote)
+    label = remote_file
+    # Progress: folder N/M, with running file count in the label
+    prog_total = max(folder_total, 1)
+    prog_index = min(folder_index, prog_total)
+
+    try:
+        remote_size = await _stat_size(afc, remote_file)
+    except Exception:
+        remote_size = 0
+
+    if local_file.is_file() and remote_size > 0 and local_file.stat().st_size == remote_size:
+        handled_remotes.add(remote_file)
+        succeeded.append(
+            {
+                "timestamp": _now(),
+                "device": device_name,
+                "source_folder": logical_folder,
+                "file_name": local_file.name,
+                "relative_path": str(local_file.relative_to(destination)).replace(
+                    "\\", "/"
+                ),
+                "destination_path": str(local_file),
+                "status": "Skipped (already copied)",
+            }
+        )
+        if on_progress:
+            on_progress(
+                f"[folder {folder_index}/{folder_total}] {label} (on disk) · files {file_index}",
+                prog_index,
+                prog_total,
+                "skipped",
+            )
+        return "skipped"
+
+    timeout = _file_timeout_sec(remote_size)
+    if on_progress:
+        on_progress(
+            f"[folder {folder_index}/{folder_total}] {label} · files {file_index}",
+            prog_index,
+            prog_total,
+            "copying",
+        )
+
+    try:
+        if local_file.exists():
+            try:
+                local_file.unlink()
+            except OSError:
+                pass
+        await asyncio.wait_for(
+            _pull_file(afc, remote_file, local_file),
+            timeout=timeout,
+        )
+        if not local_file.is_file() or local_file.stat().st_size == 0:
+            alt = local_file.parent / Path(remote_file).name
+            if alt.is_file() and alt != local_file:
+                local_file = alt
+        if not local_file.is_file():
+            raise AfcError("File missing after pull")
+
+        handled_remotes.add(remote_file)
+        succeeded.append(
+            {
+                "timestamp": _now(),
+                "device": device_name,
+                "source_folder": logical_folder,
+                "file_name": local_file.name,
+                "relative_path": str(local_file.relative_to(destination)).replace(
+                    "\\", "/"
+                ),
+                "destination_path": str(local_file),
+                "status": "Copied",
+            }
+        )
+        if on_progress:
+            on_progress(
+                f"[folder {folder_index}/{folder_total}] {label} · files {file_index}",
+                prog_index,
+                prog_total,
+                "done",
+            )
+        return "ok"
+
+    except asyncio.TimeoutError:
+        handled_remotes.add(remote_file)
+        failed.append(
+            {
+                "timestamp": _now(),
+                "device": device_name,
+                "source_folder": logical_folder,
+                "file_name": Path(remote_file).name,
+                "relative_path": remote_file,
+                "source_path": remote_file,
+                "destination_path": str(local_file),
+                "error": f"Timed out after {int(timeout)}s — skipped",
+                "status": "Skipped",
+            }
+        )
+        if on_progress:
+            on_progress(
+                f"[folder {folder_index}/{folder_total}] {label} (timeout)",
+                prog_index,
+                prog_total,
+                "skipped",
+            )
+        return "timeout"
+
+    except Exception as exc:  # noqa: BLE001
+        handled_remotes.add(remote_file)
+        failed.append(
+            {
+                "timestamp": _now(),
+                "device": device_name,
+                "source_folder": logical_folder,
+                "file_name": Path(remote_file).name,
+                "relative_path": remote_file,
+                "source_path": remote_file,
+                "destination_path": str(local_file),
+                "error": str(exc),
+                "status": "Skipped",
+            }
+        )
+        if on_progress:
+            on_progress(
+                f"[folder {folder_index}/{folder_total}] {label} (error)",
+                prog_index,
+                prog_total,
+                "skipped",
+            )
+        err = str(exc).lower()
+        if any(
+            token in err
+            for token in ("connection", "broken", "eof", "socket", "closed")
+        ):
+            return "disconnect"
+        return "error"
+
+
 async def _copy_media_folder(
     lockdown,
     remote: str,
@@ -414,158 +598,66 @@ async def _copy_media_folder(
 ) -> tuple[int, bool]:
     """
     Copy one media folder file-by-file with timeouts.
+    Walks and copies immediately (no full-tree pre-count).
     Returns (next_file_index, needs_reconnect).
     """
     from pymobiledevice3.services.afc import AfcService
 
+    del file_total  # progress is folder-based now
     file_index = file_index_start
     async with AfcService(lockdown=lockdown) as afc:
-        # If remote is empty, copy each top-level media directory
-        targets: list[str]
+        # Expand broad folders (Media root / DCIM) into child dirs so the first
+        # file lands quickly and progress advances per album/folder.
         if not remote:
-            targets = [
-                name
-                for name in await _listdir(afc, "")
-                if await _isdir(afc, name)
-            ]
+            targets = await _immediate_subdirs(afc, "")
         else:
-            targets = [remote]
+            subdirs = await _immediate_subdirs(afc, remote)
+            only_subdirs = subdirs and not await _has_immediate_files(afc, remote)
+            shallow = remote.count("/") == 0  # e.g. DCIM, Downloads
+            if only_subdirs and shallow:
+                targets = [_join(remote, name) for name in subdirs]
+            else:
+                targets = [remote]
 
-        for folder_remote in targets:
-            files = await _collect_files(afc, folder_remote)
-            # Adjust total if we discovered more precisely for this folder only
-            # (file_total may be 0 when unknown — then use local count)
-            local_total = file_total if file_total > 0 else max(len(files), 1)
+        folder_total = max(len(targets), 1)
+        if on_progress:
+            on_progress(
+                f"Starting copy of {logical_folder} ({folder_total} subfolder(s))",
+                0,
+                folder_total,
+                "starting",
+            )
 
-            for remote_file in files:
+        for folder_i, folder_remote in enumerate(targets, start=1):
+            if on_progress:
+                on_progress(
+                    f"Opening {folder_remote}",
+                    folder_i,
+                    folder_total,
+                    "listing",
+                )
+
+            async for remote_file in _iter_files(afc, folder_remote):
                 if remote_file in handled_remotes:
                     continue
                 file_index += 1
-                local_file = _local_path_for(destination, remote_file, folder_remote)
-                label = remote_file
-
-                # Resume: skip existing same-size files
-                try:
-                    remote_size = await _stat_size(afc, remote_file)
-                except Exception:
-                    remote_size = 0
-
-                if local_file.is_file() and remote_size > 0 and local_file.stat().st_size == remote_size:
-                    handled_remotes.add(remote_file)
-                    succeeded.append(
-                        {
-                            "timestamp": _now(),
-                            "device": device_name,
-                            "source_folder": logical_folder,
-                            "file_name": local_file.name,
-                            "relative_path": str(local_file.relative_to(destination)).replace("\\", "/"),
-                            "destination_path": str(local_file),
-                            "status": "Skipped (already copied)",
-                        }
-                    )
-                    if on_progress:
-                        on_progress(
-                            f"{label} (already on disk)",
-                            file_index,
-                            local_total,
-                            "skipped",
-                        )
-                    continue
-
-                timeout = _file_timeout_sec(remote_size)
-                if on_progress:
-                    on_progress(label, file_index, local_total, "copying")
-
-                try:
-                    # Remove partial leftovers from a previous interrupted pull
-                    if local_file.exists():
-                        try:
-                            local_file.unlink()
-                        except OSError:
-                            pass
-                    await asyncio.wait_for(
-                        _pull_file(afc, remote_file, local_file),
-                        timeout=timeout,
-                    )
-                    if not local_file.is_file() or local_file.stat().st_size == 0:
-                        # Some pulls write basename only — check alternate
-                        alt = local_file.parent / Path(remote_file).name
-                        if alt.is_file() and alt != local_file:
-                            local_file = alt
-                    if not local_file.is_file():
-                        raise AfcError("File missing after pull")
-
-                    handled_remotes.add(remote_file)
-                    succeeded.append(
-                        {
-                            "timestamp": _now(),
-                            "device": device_name,
-                            "source_folder": logical_folder,
-                            "file_name": local_file.name,
-                            "relative_path": str(
-                                local_file.relative_to(destination)
-                            ).replace("\\", "/"),
-                            "destination_path": str(local_file),
-                            "status": "Copied",
-                        }
-                    )
-                    if on_progress:
-                        on_progress(label, file_index, local_total, "done")
-
-                except asyncio.TimeoutError:
-                    handled_remotes.add(remote_file)
-                    failed.append(
-                        {
-                            "timestamp": _now(),
-                            "device": device_name,
-                            "source_folder": logical_folder,
-                            "file_name": Path(remote_file).name,
-                            "relative_path": remote_file,
-                            "source_path": remote_file,
-                            "destination_path": str(local_file),
-                            "error": f"Timed out after {int(timeout)}s — skipped",
-                            "status": "Skipped",
-                        }
-                    )
-                    if on_progress:
-                        on_progress(
-                            f"{label} (timeout — skipped)",
-                            file_index,
-                            local_total,
-                            "skipped",
-                        )
-                    # Connection may be unhealthy after cancel — reconnect
+                result = await _copy_one_remote_file(
+                    afc,
+                    remote_file=remote_file,
+                    folder_remote=folder_remote,
+                    destination=destination,
+                    device_name=device_name,
+                    logical_folder=logical_folder,
+                    file_index=file_index,
+                    folder_index=folder_i,
+                    folder_total=folder_total,
+                    on_progress=on_progress,
+                    succeeded=succeeded,
+                    failed=failed,
+                    handled_remotes=handled_remotes,
+                )
+                if result in {"timeout", "disconnect"}:
                     return file_index, True
-
-                except Exception as exc:  # noqa: BLE001
-                    handled_remotes.add(remote_file)
-                    failed.append(
-                        {
-                            "timestamp": _now(),
-                            "device": device_name,
-                            "source_folder": logical_folder,
-                            "file_name": Path(remote_file).name,
-                            "relative_path": remote_file,
-                            "source_path": remote_file,
-                            "destination_path": str(local_file),
-                            "error": str(exc),
-                            "status": "Skipped",
-                        }
-                    )
-                    if on_progress:
-                        on_progress(
-                            f"{label} (error — skipped)",
-                            file_index,
-                            local_total,
-                            "skipped",
-                        )
-                    # Soft errors: keep going; hard disconnect: reconnect
-                    err = str(exc).lower()
-                    if any(
-                        token in err
-                        for token in ("connection", "broken", "eof", "socket", "closed")
-                    ):
-                        return file_index, True
 
     return file_index, False
 
@@ -714,29 +806,6 @@ async def _copy_app_folder(
     return file_index, False
 
 
-async def _estimate_file_total(lockdown, folder_paths: list[str]) -> int:
-    """Best-effort count of files for progress (media folders only)."""
-    from pymobiledevice3.services.afc import AfcService
-
-    total = 0
-    try:
-        async with AfcService(lockdown=lockdown) as afc:
-            for logical in folder_paths:
-                parsed = parse_logical_path(logical)
-                if parsed["kind"] != "media":
-                    continue
-                remote = parsed["remote"]
-                if not remote:
-                    for name in await _listdir(afc, ""):
-                        if await _isdir(afc, name):
-                            total += len(await _collect_files(afc, name))
-                else:
-                    total += len(await _collect_files(afc, remote))
-    except Exception:
-        return 0
-    return total
-
-
 def _expand_copy_targets(folder_paths: list[str]) -> list[str]:
     """Expand virtual tree nodes into concrete media/app targets."""
     expanded: list[str] = []
@@ -779,19 +848,27 @@ async def _copy_folders_async(
     device_name = serial
     targets = _expand_copy_targets(folder_paths)
 
-    # Fresh lockdown per folder keeps USB sessions healthy after timeouts.
-    async with await create_using_usbmux(serial=serial) as lockdown:
-        device_name = str(getattr(lockdown, "display_name", None) or serial)
-        if on_progress:
-            on_progress("Counting files…", 0, 1, "preparing")
-        file_total = await _estimate_file_total(lockdown, targets)
-    if file_total <= 0:
-        file_total = 1
+    # No upfront file count — that walked the whole phone and looked "stuck".
+    # Copy starts immediately; progress is per folder + running file count.
+    if on_progress:
+        on_progress(
+            f"Starting copy ({len(targets)} target(s)) — files will appear in the destination soon",
+            0,
+            max(len(targets), 1),
+            "starting",
+        )
 
     file_index = 0
-    for logical in targets:
+    for target_i, logical in enumerate(targets, start=1):
         parsed = parse_logical_path(logical)
         handled_remotes: set[str] = set()
+        if on_progress:
+            on_progress(
+                f"Target {target_i}/{len(targets)}: {logical}",
+                target_i - 1,
+                max(len(targets), 1),
+                "starting",
+            )
         # Multiple passes: after a timeout/disconnect, reconnect and continue
         # remaining files (already-handled remotes are skipped).
         for _pass in range(8):
@@ -809,7 +886,7 @@ async def _copy_folders_async(
                         succeeded=succeeded,
                         failed=failed,
                         file_index_start=file_index,
-                        file_total=file_total,
+                        file_total=0,
                         handled_remotes=handled_remotes,
                     )
                     if needs_reconnect:
@@ -828,7 +905,7 @@ async def _copy_folders_async(
                         succeeded=succeeded,
                         failed=failed,
                         file_index_start=file_index,
-                        file_total=max(file_total, file_index + 1),
+                        file_total=max(file_index + 1, 1),
                     )
                     if needs_reconnect:
                         continue
